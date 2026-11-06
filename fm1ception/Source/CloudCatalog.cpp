@@ -505,12 +505,131 @@ juce::StringArray CloudCatalog::scriptsIn (const juce::String& text)
 }
 
 //==============================================================================
+juce::File CloudCatalog::failuresPath() const
+{
+    return cache.getSiblingFile (cache.getFileNameWithoutExtension() + "-failures.json");
+}
+
+juce::String CloudCatalog::fingerprintOf (const Entry& e)
+{
+    return e.id + "|" + e.version + "|" + e.package + "|" + e.sha256 + "|" + e.embedded + "|" + e.installer + "|" + e.hub;
+}
+
+void CloudCatalog::loadPersistedFailures()
+{
+    persistedFailures.clear();
+    const auto path = failuresPath();
+    if (! path.existsAsFile())
+        return;
+    const auto v = juce::JSON::parse (path.loadFileAsString());
+    const auto* a = v["failures"].getArray();
+    if (a == nullptr)
+        return;
+    for (const auto& x : *a)
+    {
+        if (! x.isObject())
+            continue;
+        const auto key = x["key"].toString();
+        const auto fp = x["fingerprint"].toString();
+        const auto msg = x["message"].toString();
+        if (key.isEmpty() || msg.isEmpty())
+            continue;
+        PersistedFailure p;
+        p.fingerprint = fp;
+        p.message = msg;
+        p.when = (juce::int64) x["when"];
+        persistedFailures[key] = std::move (p);
+    }
+}
+
+void CloudCatalog::savePersistedFailures() const
+{
+    if (! persistedDirty)
+        return;
+    juce::Array<juce::var> rows;
+    for (const auto& [key, p] : persistedFailures)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("key", key);
+        o->setProperty ("fingerprint", p.fingerprint);
+        o->setProperty ("message", p.message);
+        o->setProperty ("when", p.when);
+        rows.add (juce::var (o));
+    }
+    auto* top = new juce::DynamicObject();
+    top->setProperty ("failures", rows);
+    if (failuresPath().getParentDirectory().createDirectory())
+        failuresPath().replaceWithText (juce::JSON::toString (juce::var (top), true));
+    const_cast<CloudCatalog*> (this)->persistedDirty = false;
+}
+
+void CloudCatalog::mergePersistedFailures()
+{
+    if (list.empty())
+    {
+        if (! persistedFailures.empty() || ! failures.empty())
+        {
+            persistedFailures.clear();
+            failures.clear();
+            persistedDirty = true;
+        }
+        return;
+    }
+
+    std::map<juce::String, Entry> rowByKey;
+    for (const auto& e : list)
+        rowByKey[e.key()] = e;
+
+    for (auto it = persistedFailures.begin(); it != persistedFailures.end();)
+    {
+        const auto at = rowByKey.find (it->first);
+        if (at == rowByKey.end() || it->second.fingerprint != fingerprintOf (at->second))
+        {
+            it = persistedFailures.erase (it);
+            persistedDirty = true;
+        }
+        else
+            ++it;
+    }
+
+    for (auto it = failures.begin(); it != failures.end();)
+    {
+        if (rowByKey.find (it->first) == rowByKey.end())
+            it = failures.erase (it);
+        else
+            ++it;
+    }
+
+    for (const auto& [key, p] : persistedFailures)
+        failures[key] = p.message;
+}
+
+void CloudCatalog::clearFailure (const juce::String& key)
+{
+    failures.erase (key);
+    if (persistedFailures.erase (key) != 0)
+        persistedDirty = true;
+}
+
+void CloudCatalog::rememberFailure (const Entry& e, const juce::String& error)
+{
+    if (error.isEmpty())
+        return;
+    PersistedFailure p;
+    p.fingerprint = fingerprintOf (e);
+    p.message = error;
+    p.when = juce::Time::getCurrentTime().toMilliseconds();
+    persistedFailures[e.key()] = std::move (p);
+    failures[e.key()] = error;
+    persistedDirty = true;
+}
+
+//==============================================================================
 CloudCatalog::CloudCatalog (FirmwareLibrary& lib, juce::File c, std::vector<juce::URL> l, juce::URL h)
     : library (lib), cache (std::move (c)), sources (std::move (l)), hubSource (std::move (h)), lists (sources.size())
 {
     loadCache();
     reindex();
-    describeLibrary();
     library.addChangeListener (this);
 }
 
@@ -519,6 +638,7 @@ CloudCatalog::~CloudCatalog()
     quitting = true;
     pool.removeAllJobs (true, 30000);
     cancelPendingUpdate();
+    savePersistedFailures();
     library.removeChangeListener (this);
 }
 
@@ -529,6 +649,7 @@ juce::File CloudCatalog::cacheOf (size_t index) const
 
 void CloudCatalog::loadCache()
 {
+    loadPersistedFailures();
     if (! cache.existsAsFile())
         return;
     juce::String error;
@@ -538,6 +659,7 @@ void CloudCatalog::loadCache()
         if (cacheOf (i).existsAsFile())
             parse (cacheOf (i).loadFileAsString(), lists[i], error);
     remerge (hubIndex);
+    mergePersistedFailures();
     if (! list.empty())
         fetched = cache.getLastModificationTime();
 }
@@ -874,15 +996,15 @@ void CloudCatalog::takeLists (const std::vector<Fetched>& got, const HubIndex* h
     if (! any && hub == nullptr)
         return;
     remerge (hub != nullptr ? *hub : hubIndex);
+    mergePersistedFailures();
     reindex();
-    describeLibrary();
+    savePersistedFailures();
 }
 
 //==============================================================================
 void CloudCatalog::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     reindex();
-    describeLibrary();
     sendChangeMessage();
 }
 
@@ -1021,22 +1143,68 @@ void CloudCatalog::describeLibrary()
 void CloudCatalog::reindex()
 {
     rebuildNames();
+    // what the lists say of each file first: the index goes by it
+    describeLibrary();
     byKey.clear();
-    versionsById.clear();
+    heldById.clear();
+    using How = FirmwareLibrary::Listing::How;
     for (const auto& it : library.items())
     {
-        if (it.cloudId.isEmpty())
+        if (it.cloudId.isNotEmpty())
         {
-            // put in the folder some other way, byte for byte the package the list has now: that is in it
-            if (it.listing.how == FirmwareLibrary::Listing::How::checksum && it.listing.ref.startsWith ("list:"))
-                if (const auto e = entryById.find (it.listing.ref.fromFirstOccurrenceOf (":", false, false)); e != entryById.end())
-                    byKey.emplace (list[e->second].key(), it.file);
+            byKey[it.cloudId] = it.file;
+            heldById[it.cloudId.upToLastOccurrenceOf ("@", false, false)].push_back (
+                { it.file, it.cloudId.fromLastOccurrenceOf ("@", false, false), true });
             continue;
         }
-        byKey[it.cloudId] = it.file;
-        versionsById[it.cloudId.upToLastOccurrenceOf ("@", false, false)].addIfNotAlreadyThere (
-            it.cloudId.fromLastOccurrenceOf ("@", false, false));
+        if (! it.listing.ref.startsWith ("list:"))
+            continue;
+        const auto e = entryById.find (it.listing.ref.fromFirstOccurrenceOf (":", false, false));
+        if (e == entryById.end())
+            continue;
+        const auto& entry = list[e->second];
+        // put in the folder some other way, byte for byte the package the list has now: that is in it
+        if (it.listing.how == How::checksum)
+        {
+            byKey.emplace (entry.key(), it.file);
+            heldById[entry.id].push_back ({ it.file, it.listing.version, true });
+        }
+        // one named for it (a release its list no longer links): its own name, not one made from it
+        else if (it.listing.how == How::name)
+        {
+            const auto own = FirmwareLibrary::normalise (it.ownName().first);
+            if (own.isNotEmpty() && (own == FirmwareLibrary::normalise (entry.name) || own == FirmwareLibrary::normalise (entry.id)))
+                heldById[entry.id].push_back ({ it.file, it.version(), false });
+        }
     }
+}
+
+juce::String CloudCatalog::comparableVersion (const Entry& e)
+{
+    if (e.version.containsAnyOf ("0123456789"))
+        return e.version;
+    const auto file = e.package.upToFirstOccurrenceOf ("?", false, false).fromLastOccurrenceOf ("/", false, false);
+    return FirmwareLibrary::splitVersion (juce::URL::removeEscapeChars (file).upToLastOccurrenceOf (".", false, false)).second;
+}
+
+const CloudCatalog::Held* CloudCatalog::heldCurrent (const Entry& e) const
+{
+    const auto at = heldById.find (e.id);
+    if (at == heldById.end())
+        return nullptr;
+    const auto want = comparableVersion (e);
+    const Held* best = nullptr;
+    for (const auto& h : at->second)
+    {
+        if (! h.file.existsAsFile())
+            continue;
+        const auto c = FirmwareLibrary::compareVersions (h.version, want);
+        // a download of another version that cannot be told apart from it is not it
+        const bool current = c.has_value() ? *c >= 0 : ! h.exact;
+        if (current && (best == nullptr || FirmwareLibrary::compareVersions (h.version, best->version).value_or (0) > 0))
+            best = &h;
+    }
+    return best;
 }
 
 CloudCatalog::Status CloudCatalog::statusOf (const Entry& e) const
@@ -1045,25 +1213,34 @@ CloudCatalog::Status CloudCatalog::statusOf (const Entry& e) const
         return Status::downloading;
     if (const auto it = byKey.find (e.key()); it != byKey.end() && it->second.existsAsFile())
         return Status::inLibrary;
+    if (heldCurrent (e) != nullptr)
+        return Status::inLibrary;
     if (! e.downloadable())
         return Status::installerOnly;
     if (failures.count (e.key()) != 0)
         return Status::failed;
-    if (versionsById.count (e.id) != 0)
+    if (const auto at = heldById.find (e.id); at != heldById.end()
+        && std::any_of (at->second.begin(), at->second.end(), [] (const Held& h) { return h.file.existsAsFile(); }))
         return Status::update;
     return Status::get;
 }
 
 juce::String CloudCatalog::failureOf (const Entry& e) const
 {
-    const auto it = failures.find (e.key());
-    return it != failures.end() ? it->second : juce::String();
+    if (const auto it = failures.find (e.key()); it != failures.end())
+        return it->second;
+    if (const auto p = persistedFailures.find (e.key()); p != persistedFailures.end())
+        return p->second.message;
+    return {};
 }
 
 juce::File CloudCatalog::fileOf (const Entry& e) const
 {
-    const auto it = byKey.find (e.key());
-    return it != byKey.end() && it->second.existsAsFile() ? it->second : juce::File();
+    if (const auto it = byKey.find (e.key()); it != byKey.end() && it->second.existsAsFile())
+        return it->second;
+    if (const auto* h = heldCurrent (e))
+        return h->file;
+    return {};
 }
 
 juce::File CloudCatalog::downloadFolder() const
@@ -1078,7 +1255,8 @@ void CloudCatalog::download (const Entry& e, Done then)
 {
     auto fail = [&] (const juce::String& why)
     {
-        failures[e.key()] = why;
+        rememberFailure (e, why);
+        savePersistedFailures();
         sendChangeMessage();
         if (then != nullptr)
             then ({}, why);
@@ -1103,7 +1281,8 @@ void CloudCatalog::download (const Entry& e, Done then)
     if (! folder.createDirectory())
         return fail ("Could not make the folder " + folder.getFullPathName());
 
-    failures.erase (e.key());
+    clearFailure (e.key());
+    savePersistedFailures();
     downloading[e.key()].push_back (std::move (then));
     ++inFlight;
     sendChangeMessage();
@@ -1160,11 +1339,23 @@ void CloudCatalog::finished (const Entry& e, const juce::File& file, const juce:
         }
     }
     if (error.isEmpty())
+    {
+        clearFailure (key);
         library.adopt (file, key, e.repo);
+    }
     else
-        failures[key] = error;
+    {
+        if (const auto* row = find (key); row != nullptr)
+            rememberFailure (*row, error);
+        else
+        {
+            // the Hub may have moved this row to a new id@version key
+            failures[key] = error;
+            persistedDirty = true;
+        }
+    }
+    savePersistedFailures();
     reindex();
-    describeLibrary();
     sendChangeMessage();
     for (auto& then : waiting)
         if (then != nullptr)

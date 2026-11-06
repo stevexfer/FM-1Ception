@@ -3,6 +3,7 @@
 #include <JuceHeader.h>
 #include "CloudView.h"
 #include "InfoPanel.h"
+#include <set>
 
 namespace fm1c
 {
@@ -22,6 +23,11 @@ namespace fm1c
 // firmwares instead (CloudView), to download into the folder. INFO shows the
 // panel at the right (InfoPanel): the firmware under the mouse, else the one
 // selected, with its screens.
+//
+// The grid button beside INFO shows the firmwares as tiles instead (Tiles): each
+// with its screen and its name large, sorted from a menu. Above the table or the
+// tiles, filters: a category (Cmd-click for more than one), the rated ones, the
+// ones added in the last kNewDays days. They narrow what the search finds.
 //==============================================================================
 class LibraryView : public juce::Component,
                     public juce::DragAndDropContainer,
@@ -44,6 +50,7 @@ public:
     void resized() override;
     void mouseMove (const juce::MouseEvent&) override;
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
 
     /** CLOUD rather than LOCAL (fetching the list if this process has not yet). */
     void showCloud (bool);
@@ -65,6 +72,14 @@ public:
     static juce::String formatDay (juce::Time);
     /** The row of `table` under the mouse, -1 if none is. */
     static int rowUnderMouse (const juce::TableListBox&);
+
+    /** The firmwares as tiles, with their screens, rather than the table (kept with the library). */
+    void showTiles (bool);
+    bool areTilesShown() const;
+    /** What the filters let through: these categories (none: all; Category::none: those with
+        none), rated ones only, ones added in the last kNewDays days only. */
+    void setFilters (const std::set<FirmwareLibrary::Category>&, bool ratedOnly, bool newOnly);
+    static constexpr int kNewDays = 30;
 
     /** The info panel, shown (and wide enough to be). */
     void showInfo (bool);
@@ -96,6 +111,8 @@ private:
     class Stars;
     class Link;
     class NameEditor;
+    class Tiles;
+    class GridButton;
 
     // TableListBoxModel
     int getNumRows() override { return numRows(); }
@@ -133,6 +150,24 @@ private:
     void editUrl (int row);
     void choosePath();
     void updateStatus();
+    /** A name or URL edited in a box of its own, where the tiles have no cell for it. */
+    void editInDialog (const juce::File&, bool url);
+
+    // the filters
+    struct Chip
+    {
+        enum Kind { all, category, rated, recent, more } kind = all;
+        FirmwareLibrary::Category cat = FirmwareLibrary::Category::none;
+        juce::String label;
+        int count = -1;
+        bool on = false;
+        juce::Rectangle<int> area;
+    };
+    bool passesToggles (const FirmwareLibrary::Item&) const;
+    void layoutChips();
+    void chipClicked (const Chip&, const juce::ModifierKeys&);
+    void syncSortBox();
+    bool filtering() const { return ! categoryFilter.empty() || ratedOnly || newOnly; }
 
     FirmwareLibrary& library;
     Engines engines;
@@ -143,6 +178,18 @@ private:
     std::unique_ptr<CloudView> cloudTable;
     juce::TextEditor search;
     juce::TableListBox table { "Firmware Library", this };
+    std::unique_ptr<GridButton> tilesButton;
+    // (the tiles outlive the viewport that shows them)
+    std::unique_ptr<Tiles> tiles;
+    juce::Viewport tileViewport;
+    juce::ComboBox sortBox;
+    std::set<FirmwareLibrary::Category> categoryFilter;
+    bool ratedOnly = false, newOnly = false;
+    std::map<FirmwareLibrary::Category, int> categoryCounts;
+    int togglePassCount = 0;
+    std::vector<Chip> chips, moreChips;
+    int hoveredChip = -1;
+    juce::Rectangle<int> filterArea;
     juce::Label note;
     InfoPanel info;
     juce::String infoKey;
@@ -158,7 +205,7 @@ private:
     juce::File editingName;
     juce::String status, emptyNote;
 
-    static constexpr int kBarH = 40, kStatusH = 22, kTabW = 58, kSourceW = 100;
+    static constexpr int kBarH = 40, kFilterH = 36, kStatusH = 22, kTabW = 58, kSourceW = 100;
     /** Narrower than this, the window has no room for the info panel. */
     static constexpr int kInfoMinWidth = 760;
     juce::Rectangle<int> labelArea, pathArea;

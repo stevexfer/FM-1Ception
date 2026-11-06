@@ -321,6 +321,7 @@ void FirmwareLibrary::load()
     cloudColumns = v["cloudColumns"].toString();
     cloudShown = v["browse"].toString() == "cloud";
     infoShown = ! v.hasProperty ("info") || (bool) v["info"];
+    tilesShown = v["view"].toString() == "tiles";
     if (const auto* list = v["items"].getArray())
         for (const auto& e : *list)
         {
@@ -442,6 +443,7 @@ void FirmwareLibrary::save()
         top->setProperty ("cloudColumns", cloudColumns);
     top->setProperty ("browse", cloudShown ? "cloud" : "local");
     top->setProperty ("info", infoShown);
+    top->setProperty ("view", tilesShown ? "tiles" : "table");
     top->setProperty ("items", list);
 
     if (database.getParentDirectory().createDirectory())
@@ -809,6 +811,22 @@ juce::String sameNameKey (const FirmwareLibrary::Item& it)
     return FirmwareLibrary::normalise (it.listing.exact() && it.listing.name.isNotEmpty() ? it.listing.name : it.ownName().first);
 }
 } // namespace
+
+std::optional<int> FirmwareLibrary::compareVersions (const juce::String& a, const juce::String& b)
+{
+    const auto va = versionNumber (a), vb = versionNumber (b);
+    if (va.first.empty() || vb.first.empty() || (va.first[0] >= 1000) != (vb.first[0] >= 1000))
+        return std::nullopt;
+    for (size_t i = 0; i < juce::jmax (va.first.size(), vb.first.size()); ++i)
+    {
+        const int x = i < va.first.size() ? va.first[i] : 0, y = i < vb.first.size() ? vb.first[i] : 0;
+        if (x != y)
+            return x > y ? 1 : -1;
+    }
+    if (va.second != vb.second)
+        return std::nullopt;
+    return 0;
+}
 
 int FirmwareLibrary::newer (const Item& a, const Item& b)
 {

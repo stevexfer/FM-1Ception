@@ -127,6 +127,10 @@ void ScreenCache::want (Job job, bool again)
         return;
     {
         const juce::ScopedLock sl (lock);
+        if (backgroundNow == job.key && ! again)
+            return;
+        background.erase (std::remove_if (background.begin(), background.end(), [&job] (const Job& j) { return j.key == job.key; }),
+                          background.end());
         // the one asked for last goes first: one not yet begun is let go
         if (wanted.has_value())
             shots.erase (wanted->key);
@@ -159,6 +163,64 @@ juce::Image ScreenCache::cardOf (const juce::String& url)
     cardQueue.push_back (url);
     work.signal();
     return {};
+}
+
+bool ScreenCache::known (const juce::String& key) const
+{
+    if (const auto it = shots.find (key); it != shots.end() && (it->second.has() || it->second.error.isNotEmpty() || it->second.capturing))
+        return true;
+    return shotFile (key, true).existsAsFile() || shotFile (key, false).existsAsFile() || failedFile (key).existsAsFile();
+}
+
+juce::Image ScreenCache::thumbOf (const juce::String& key)
+{
+    if (key.isEmpty())
+        return {};
+    const juce::ScopedLock sl (lock);
+    for (auto it = thumbs.begin(); it != thumbs.end(); ++it)
+        if (it->first == key)
+        {
+            thumbs.splice (thumbs.begin(), thumbs, it);
+            return it->second;
+        }
+    juce::Image img;
+    if (const auto it = shots.find (key); it != shots.end() && it->second.has())
+        img = it->second.late.isValid() ? it->second.late : it->second.early;
+    else if (img = readImage (shotFile (key, true)); ! img.isValid())
+        img = readImage (shotFile (key, false));
+    thumbs.emplace_front (key, img);
+    if (thumbs.size() > kThumbs)
+        thumbs.pop_back();
+    return img;
+}
+
+void ScreenCache::captureInBackground (std::vector<std::pair<juce::String, juce::File>> jobs)
+{
+    {
+        const juce::ScopedLock sl (lock);
+        background.clear();
+        for (auto& [key, file] : jobs)
+            if (key.isNotEmpty() && key != backgroundNow && ! (wanted.has_value() && wanted->key == key) && ! known (key))
+                background.push_back ({ key, std::move (file), {} });
+        if (background.empty())
+            return;
+    }
+    work.signal();
+}
+
+bool ScreenCache::hasFailed (const juce::String& key)
+{
+    const juce::ScopedLock sl (lock);
+    if (const auto it = shots.find (key); it != shots.end())
+        return ! it->second.has() && it->second.error.isNotEmpty();
+    return failedFile (key).existsAsFile();
+}
+
+bool ScreenCache::isQueued (const juce::String& key)
+{
+    const juce::ScopedLock sl (lock);
+    return key == backgroundNow
+        || std::any_of (background.begin(), background.end(), [&key] (const Job& j) { return j.key == key; });
 }
 
 juce::String ScreenCache::captureNow (const juce::MemoryBlock& package, juce::Image& early, juce::Image& late)
@@ -197,6 +259,12 @@ void ScreenCache::run()
                 {
                     job = std::move (wanted);
                     wanted.reset();
+                }
+                else if (! background.empty())
+                {
+                    job = std::move (background.front());
+                    background.pop_front();
+                    backgroundNow = job->key;
                 }
                 if (cardUrl || job)
                     ++busy;
@@ -246,7 +314,12 @@ void ScreenCache::run()
                     failedFile (job->key).replaceWithText (error);
                 }
                 const juce::ScopedLock sl (lock);
-                shots[job->key] = s;
+                thumbs.remove_if ([&job] (const auto& t) { return t.first == job->key; });
+                // (one captured for a tile is read from disk when it is shown larger: hundreds are not kept)
+                if (backgroundNow == job->key)
+                    backgroundNow = {};
+                else
+                    shots[job->key] = s;
             }
             --busy;
             triggerAsyncUpdate();
@@ -266,7 +339,7 @@ bool ScreenCache::waitForIdle (int timeoutMs)
     {
         {
             const juce::ScopedLock sl (lock);
-            if (! wanted.has_value() && cardQueue.empty() && busy == 0)
+            if (! wanted.has_value() && cardQueue.empty() && background.empty() && busy == 0)
                 break;
         }
         if (juce::Time::getMillisecondCounter() > end)

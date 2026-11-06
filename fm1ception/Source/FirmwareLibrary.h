@@ -162,6 +162,9 @@ public:
         in it (of one kind: a year is not one), a commit's hash after it aside, else by DATE UPDATED;
         the same in both, the one whose file's name sorts first. */
     static int newer (const Item& a, const Item& b);
+    /** Two versions by their numbers: 1 if `a` is newer, -1 if `b` is, 0 if they are one; none if
+        that cannot be told (no number in one, a year against a "0.3.2", variants of one number). */
+    static std::optional<int> compareVersions (const juce::String& a, const juce::String& b);
     struct Older
     {
         juce::File file, keep;
@@ -194,6 +197,9 @@ public:
     /** The window's info panel shown (InfoPanel). */
     bool isInfoShown() const { return infoShown; }
     void setInfoShown (bool b) { if (b != infoShown) { infoShown = b; markDirty(); } }
+    /** The window shows its firmwares as tiles, with their screens, rather than the table. */
+    bool areTilesShown() const { return tilesShown; }
+    void setTilesShown (bool b) { if (b != tilesShown) { tilesShown = b; markDirty(); } }
 
     /** Writes now rather than a moment after the last change. */
     void flush();
@@ -240,7 +246,7 @@ private:
     std::vector<Record> records;
     juce::String windowState, columns, cloudColumns;
     juce::Time diskTime;
-    bool dirty = false, scanning = false, scanAgain = false, cloudShown = false, infoShown = true;
+    bool dirty = false, scanning = false, scanAgain = false, cloudShown = false, infoShown = true, tilesShown = false;
 
     std::unique_ptr<Scanner> scanner;
     juce::CriticalSection resultLock;

@@ -124,7 +124,7 @@ juce::String CloudView::statusText (Status s)
         case Status::inLibrary:     return "In Library";
         case Status::update:        return "UPDATE";
         case Status::installerOnly: return "Installer only";
-        case Status::failed:        return "Failed - Retry";
+        case Status::failed:        return "Error - Retry";
     }
     return {};
 }
@@ -403,7 +403,7 @@ juce::String CloudView::getCellTooltip (int row, int column)
                 case Status::downloading:   return "Downloading from " + hostOf (e.package.isNotEmpty() ? e.package : e.installer);
                 case Status::inLibrary:     return cloud.fileOf (e).getFullPathName();
                 case Status::installerOnly: return "It installs from its own page, with no package to download: click to open it";
-                case Status::failed:        return cloud.failureOf (e) + "\nClick to try again";
+                case Status::failed:        return cloud.failureOf (e) + "\nRefresh keeps this until the list's package URL or checksum changes\nClick to try again";
             }
             return {};
         default:

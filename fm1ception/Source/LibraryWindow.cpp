@@ -11,6 +11,24 @@ using Category = FirmwareLibrary::Category;
 const juce::Colour rowA { 0xff1c1d20 }, rowB { 0xff202124 };
 constexpr float kStar = 13.0f, kStarGap = 1.5f, kStarsX = 6.0f;
 
+/** The tiles' sort menu: a column of the table's, and which way. */
+struct TileSort
+{
+    const char* name;
+    LibraryView::Column column;
+    bool forwards;
+};
+const TileSort kTileSorts[] {
+    { "Name", LibraryView::firmwareName, true },
+    { "Recently added", LibraryView::dateAdded, false },
+    { "Recently updated", LibraryView::dateUpdated, false },
+    { "Rating", LibraryView::rating, false },
+    { "Most launched", LibraryView::launches, false },
+    { "Category", LibraryView::category, true },
+    { "Author", LibraryView::author, true },
+    { "File name", LibraryView::fileName, true },
+};
+
 juce::Path pencilIcon (juce::Rectangle<float> r)
 {
     const auto s = juce::jmin (r.getWidth(), r.getHeight());
@@ -391,6 +409,400 @@ private:
 };
 
 //==============================================================================
+/** The bar's view button: a grid of four, lit while the tiles are shown. */
+class LibraryView::GridButton : public juce::Button
+{
+public:
+    GridButton() : juce::Button ("Tiles") { setClickingTogglesState (true); }
+
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        const auto b = getLocalBounds().toFloat().reduced (0.5f);
+        const bool on = getToggleState();
+        g.setColour (on ? theme::amber : over ? theme::tray.brighter (0.15f) : theme::tray);
+        g.fillRoundedRectangle (b, 6.0f);
+        g.setColour (on ? theme::header : over || down ? theme::silk : theme::dimSilk);
+        const auto icon = b.withSizeKeepingCentre (14.0f, 14.0f);
+        constexpr float s = 6.0f, gap = 2.0f;
+        for (int y = 0; y < 2; ++y)
+            for (int x = 0; x < 2; ++x)
+                g.fillRoundedRectangle (icon.getX() + (float) x * (s + gap), icon.getY() + (float) y * (s + gap), s, s, 1.2f);
+    }
+};
+
+//==============================================================================
+/** The firmwares as tiles: each with its screen (else the Hub's card), its name large, its version
+    and author, its category and stars. The selection is the table's, so the row menu, Delete,
+    dragging to an engine and the info panel go on as they do for the table. The tiles on screen
+    with no screens kept have them captured in the background. */
+class LibraryView::Tiles : public juce::Component,
+                           private juce::ChangeListener,
+                           private juce::Timer
+{
+public:
+    Tiles (LibraryView& o, ScreenCache* c) : owner (o), cache (c)
+    {
+        setWantsKeyboardFocus (true);
+        if (cache != nullptr)
+            cache->addChangeListener (this);
+    }
+
+    ~Tiles() override
+    {
+        if (cache != nullptr)
+            cache->removeChangeListener (this);
+    }
+
+    /** Lays them out across `width`, as many rows of them as they take. */
+    void update (int width)
+    {
+        const int inner = juce::jmax (kMinW, width - 2 * kPad);
+        cols = juce::jmax (1, (inner + kGap) / (kMinW + kGap));
+        tileW = (inner - (cols - 1) * kGap) / cols;
+        tileH = tileW + kTextH;
+        const int lines = (owner.numRows() + cols - 1) / cols;
+        setSize (width, juce::jmax (1, 2 * kPad + lines * tileH + juce::jmax (0, lines - 1) * kGap));
+        queuedFirst = queuedLast = -1;
+        repaint();
+        startTimer (150);
+    }
+
+    juce::Rectangle<int> tileBounds (int row) const
+    {
+        return { kPad + (row % cols) * (tileW + kGap), kPad + (row / cols) * (tileH + kGap), tileW, tileH };
+    }
+
+    int rowAt (juce::Point<int> p) const
+    {
+        if (p.x < kPad || p.y < kPad)
+            return -1;
+        const int c = (p.x - kPad) / (tileW + kGap), line = (p.y - kPad) / (tileH + kGap);
+        const int row = line * cols + c;
+        return c < cols && juce::isPositiveAndBelow (row, owner.numRows()) && tileBounds (row).contains (p) ? row : -1;
+    }
+
+    int rowUnderMouse() const
+    {
+        return isShowing() && isMouseOver (true) ? rowAt (getMouseXYRelative()) : -1;
+    }
+
+    void scrollTo (int row)
+    {
+        auto* vp = findParentComponentOfClass<juce::Viewport>();
+        if (vp == nullptr || ! juce::isPositiveAndBelow (row, owner.numRows()))
+            return;
+        const auto b = tileBounds (row);
+        const auto view = vp->getViewArea();
+        if (b.getY() < view.getY())
+            vp->setViewPosition (0, b.getY() - kPad);
+        else if (b.getBottom() > view.getBottom())
+            vp->setViewPosition (0, b.getBottom() + kPad - view.getHeight());
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto [first, last] = rowsIn (g.getClipBounds());
+        for (int row = first; row < last; ++row)
+            paintTile (g, row);
+        if (const auto shown = rowsIn (visibleArea()); shown.first != queuedFirst || shown.second != queuedLast)
+            startTimer (200);
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const int row = rowAt (e.getPosition());
+        setHover (row, row >= 0 ? starAt (row, e.getPosition()) : -1);
+    }
+
+    void mouseExit (const juce::MouseEvent&) override { setHover (-1, -1); }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        grabKeyboardFocus();
+        pressed = -1;
+        dragged = selectOnUp = false;
+        const int row = rowAt (e.getPosition());
+        if (row < 0)
+        {
+            if (! e.mods.isPopupMenu())
+                owner.table.deselectAllRows();
+            repaint();
+            return;
+        }
+        if (e.mods.isPopupMenu())
+        {
+            owner.selectForMenu (row);
+            repaint();
+            owner.showRowMenu (row);
+            return;
+        }
+        if (const int k = starAt (row, e.getPosition()); k >= 0)
+        {
+            const auto& it = owner.itemAt (row);
+            owner.library.setRating (it.file, k + 1 == it.rating ? 0 : k + 1);
+            return;
+        }
+        pressed = row;
+        // a click in the selection keeps it until the mouse comes up, so all of it can be dragged
+        if (owner.table.isRowSelected (row) && ! e.mods.isCommandDown() && ! e.mods.isShiftDown())
+            selectOnUp = true;
+        else
+            owner.table.selectRowsBasedOnModifierKeys (row, e.mods, false);
+        repaint();
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (pressed < 0 || dragged || e.getDistanceFromDragStart() < 6)
+            return;
+        dragged = true;
+        selectOnUp = false;
+        const auto& it = owner.itemAt (pressed);
+        auto img = pictureOf (it);
+        if (img.isValid())
+            img = img.rescaled (72, 72, juce::Graphics::mediumResamplingQuality);
+        else
+        {
+            // (with no image the drag would show all of the tiles)
+            img = juce::Image (juce::Image::ARGB, 72, 72, true);
+            juce::Graphics g (img);
+            g.setColour (theme::bezel);
+            g.fillRoundedRectangle (img.getBounds().toFloat(), 5.0f);
+            g.setColour (theme::silk);
+            g.setFont (theme::font (11.0f, true));
+            g.drawFittedText (it.name(), img.getBounds().reduced (6), juce::Justification::centred, 3);
+        }
+        owner.startDragging ("fm1c-library", this, juce::ScaledImage (img));
+    }
+
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (selectOnUp && ! dragged && pressed >= 0)
+            owner.table.selectRow (pressed);
+        selectOnUp = false;
+        pressed = -1;
+        repaint();
+    }
+
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (const int row = rowAt (e.getPosition()); row >= 0 && starAt (row, e.getPosition()) < 0)
+            owner.loadInto (owner.engines.selected(), owner.itemAt (row).file);
+    }
+
+    bool keyPressed (const juce::KeyPress& k) override
+    {
+        const int n = owner.numRows();
+        if (n == 0)
+            return false;
+        const int now = owner.table.getLastRowSelected();
+        int next;
+        if (k == juce::KeyPress::leftKey)        next = now < 0 ? 0 : now - 1;
+        else if (k == juce::KeyPress::rightKey)  next = now < 0 ? 0 : now + 1;
+        else if (k == juce::KeyPress::upKey)     next = now < 0 ? 0 : now - cols;
+        else if (k == juce::KeyPress::downKey)   next = now < 0 ? 0 : now + cols;
+        else if (k == juce::KeyPress::homeKey)   next = 0;
+        else if (k == juce::KeyPress::endKey)    next = n - 1;
+        else if (k == juce::KeyPress::returnKey)
+        {
+            if (now >= 0)
+                owner.loadInto (owner.engines.selected(), owner.itemAt (now).file);
+            return true;
+        }
+        else if (k == juce::KeyPress::deleteKey || k == juce::KeyPress::backspaceKey)
+        {
+            owner.confirmTrash (owner.selectedFiles());
+            return true;
+        }
+        else if (k == juce::KeyPress ('a', juce::ModifierKeys::commandModifier, 0))
+        {
+            owner.table.selectRangeOfRows (0, n - 1, true);
+            repaint();
+            return true;
+        }
+        else
+            return false;
+        next = juce::jlimit (0, n - 1, next);
+        owner.table.selectRow (next);
+        scrollTo (next);
+        repaint();
+        return true;
+    }
+
+private:
+    static constexpr int kMinW = 176, kGap = 14, kPad = 16, kInset = 8;
+    // below the screen: a gap, the name, its version and author, its category and stars
+    static constexpr int kNameH = 21, kSubH = 17, kFootH = 20, kTextH = 8 + kNameH + kSubH + kFootH + 4;
+    static constexpr float kStar = 11.0f, kStarGap = 1.5f;
+
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { repaint(); }
+
+    void timerCallback() override
+    {
+        stopTimer();
+        if (cache == nullptr || ! isShowing())
+            return;
+        std::tie (queuedFirst, queuedLast) = rowsIn (visibleArea());
+        // the screens on screen first, then the line below
+        std::vector<std::pair<juce::String, juce::File>> jobs;
+        for (int row = queuedFirst; row < juce::jmin (owner.numRows(), queuedLast + cols); ++row)
+            if (const auto& it = owner.itemAt (row); it.isPackage && it.digest.isNotEmpty())
+                jobs.push_back ({ it.digest, it.file });
+        cache->captureInBackground (std::move (jobs));
+    }
+
+    juce::Rectangle<int> visibleArea() const
+    {
+        if (auto* vp = findParentComponentOfClass<juce::Viewport>())
+            return vp->getViewArea();
+        return getLocalBounds();
+    }
+
+    /** The rows of the tiles `area` touches, first to one past the last. */
+    std::pair<int, int> rowsIn (juce::Rectangle<int> area) const
+    {
+        const int pitch = tileH + kGap;
+        if (pitch <= kGap)
+            return { 0, 0 };
+        const int first = juce::jmax (0, (area.getY() - kPad) / pitch) * cols;
+        const int last = juce::jmin (owner.numRows(), (juce::jmax (0, area.getBottom() - kPad) / pitch + 1) * cols);
+        return { juce::jmin (first, last), last };
+    }
+
+    juce::Rectangle<float> starBox (int row, int i) const
+    {
+        const auto b = tileBounds (row).reduced (kInset);
+        const float right = (float) b.getRight(), y = (float) b.getBottom() - 4.0f - (float) kFootH * 0.5f - kStar * 0.5f;
+        return { right - (float) (FirmwareLibrary::kMaxRating - i) * (kStar + kStarGap), y, kStar, kStar };
+    }
+
+    int starAt (int row, juce::Point<int> p) const
+    {
+        for (int i = 0; i < FirmwareLibrary::kMaxRating; ++i)
+            if (starBox (row, i).expanded (kStarGap * 0.5f, 3.0f).contains (p.toFloat()))
+                return i;
+        return -1;
+    }
+
+    void setHover (int row, int star)
+    {
+        if (row == hovered && star == hotStar)
+            return;
+        if (hovered >= 0)
+            repaint (tileBounds (hovered));
+        hovered = row;
+        hotStar = star;
+        if (hovered >= 0)
+            repaint (tileBounds (hovered));
+    }
+
+    juce::Image pictureOf (const FirmwareLibrary::Item& it) const
+    {
+        if (cache == nullptr)
+            return {};
+        if (it.isPackage && it.digest.isNotEmpty())
+            if (auto img = cache->thumbOf (it.digest); img.isValid())
+                return img;
+        if (owner.cloud != nullptr)
+            if (const auto url = owner.cloud->cardOf (it); url.isNotEmpty())
+                return cache->cardOf (url);
+        return {};
+    }
+
+    juce::String placeholderOf (const FirmwareLibrary::Item& it) const
+    {
+        if (! it.isPackage)
+            return "Not an FM-1 update package";
+        if (cache == nullptr || it.digest.isEmpty())
+            return "No screen";
+        if (cache->isQueued (it.digest))
+            return "Booting it for its screen...";
+        if (cache->hasFailed (it.digest))
+            return "Its screen could not be captured";
+        return "Its screen comes in a moment";
+    }
+
+    void paintTile (juce::Graphics& g, int row)
+    {
+        const auto& it = owner.itemAt (row);
+        const auto r = tileBounds (row);
+        const bool selected = owner.table.isRowSelected (row), hot = row == hovered;
+
+        g.setColour (selected ? theme::amber.withAlpha (0.14f) : hot ? rowB.brighter (0.07f) : rowB);
+        g.fillRoundedRectangle (r.toFloat(), 8.0f);
+        g.setColour (selected ? theme::amber.withAlpha (0.9f) : hot ? theme::tray.brighter (0.35f) : theme::tray);
+        g.drawRoundedRectangle (r.toFloat().reduced (selected ? 1.0f : 0.5f), 8.0f, selected ? 2.0f : 1.0f);
+
+        auto area = r.reduced (kInset);
+        const auto screen = area.removeFromTop (area.getWidth());
+        g.setColour (theme::bezel);
+        g.fillRoundedRectangle (screen.toFloat(), 5.0f);
+        const auto inner = screen.reduced (4);
+        if (const auto img = pictureOf (it); img.isValid())
+        {
+            g.setImageResamplingQuality (juce::Graphics::mediumResamplingQuality);
+            g.drawImage (img, juce::RectanglePlacement (juce::RectanglePlacement::centred).appliedTo (img.getBounds().toFloat(), inner.toFloat()));
+        }
+        else
+        {
+            g.setColour (it.isPackage ? theme::dimSilk.withAlpha (0.8f) : theme::warn.withAlpha (0.8f));
+            g.setFont (theme::font (11.5f));
+            g.drawFittedText (placeholderOf (it), inner.reduced (12), juce::Justification::centred, 3);
+        }
+
+        area.removeFromTop (8);
+        const auto nameFont = theme::font (15.5f, true);
+        auto line = area.removeFromTop (kNameH);
+        const auto name = it.name();
+        g.setFont (nameFont);
+        g.setColour (! it.isPackage ? theme::warn : selected ? juce::Colours::white : theme::silk);
+        g.drawText (name, line, juce::Justification::centredLeft, true);
+        if (const float w = juce::GlyphArrangement::getStringWidth (nameFont, name); isBase (it) && w < (float) line.getWidth() - 30.0f)
+        {
+            g.setFont (theme::font (13.0f));
+            g.setColour (theme::dimSilk);
+            g.drawText (FirmwareLibrary::kBaseMark, line.withTrimmedLeft ((int) std::ceil (w)), juce::Justification::centredLeft, true);
+        }
+
+        line = area.removeFromTop (kSubH);
+        juce::String sub = it.version();
+        if (it.listing.author.isNotEmpty())
+            sub << (sub.isNotEmpty() ? juce::String (juce::CharPointer_UTF8 ("  \xc2\xb7  ")) : juce::String()) << it.listing.author;
+        g.setFont (theme::font (12.5f));
+        g.setColour (theme::dimSilk);
+        g.drawText (sub.isNotEmpty() ? sub : it.file.getFileName(), line, juce::Justification::centredLeft, true);
+
+        line = area.removeFromTop (kFootH);
+        const int shown = hot && hotStar >= 0 ? hotStar + 1 : it.rating;
+        for (int i = 0; i < FirmwareLibrary::kMaxRating; ++i)
+        {
+            const auto box = starBox (row, i);
+            juce::Path p;
+            p.addStar (box.getCentre(), 5, kStar * 0.22f, kStar * 0.5f);
+            if (i < shown)
+                g.setColour (hot && hotStar >= 0 ? theme::amber.withAlpha (i < it.rating ? 1.0f : 0.6f) : theme::amber);
+            else
+                g.setColour (hot ? theme::tray.brighter (0.5f) : theme::tray.brighter (0.3f));
+            g.fillPath (p);
+        }
+        const auto cat = it.shownCategory();
+        juce::String kind = cat == Category::none ? juce::String() : FirmwareLibrary::categoryName (cat);
+        if (it.subcategory.isNotEmpty())
+            kind << juce::String (juce::CharPointer_UTF8 (" \xc2\xb7 ")) << it.subcategory;
+        g.setFont (theme::font (11.5f));
+        g.setColour (theme::silk.withAlpha (0.65f));
+        g.drawText (kind, line.withTrimmedRight ((int) ((float) FirmwareLibrary::kMaxRating * (kStar + kStarGap)) + 6),
+                    juce::Justification::centredLeft, true);
+    }
+
+    LibraryView& owner;
+    ScreenCache* const cache;
+    int cols = 1, tileW = kMinW, tileH = kMinW + kTextH;
+    int hovered = -1, hotStar = -1, pressed = -1, queuedFirst = -1, queuedLast = -1;
+    bool dragged = false, selectOnUp = false;
+};
+
+//==============================================================================
 LibraryView::LibraryView (FirmwareLibrary& lib, Engines e, CloudCatalog* c, ScreenCache* s)
     : library (lib), engines (std::move (e)), cloud (c), info (s)
 {
@@ -471,6 +883,26 @@ LibraryView::LibraryView (FirmwareLibrary& lib, Engines e, CloudCatalog* c, Scre
     };
     addAndMakeVisible (search);
 
+    tilesButton = std::make_unique<GridButton>();
+    tilesButton->setTooltip ("Expanded view: each firmware as a tile, with its screen and its name large (again for the table)");
+    tilesButton->setToggleState (library.areTilesShown(), juce::dontSendNotification);
+    tilesButton->onClick = [this] { showTiles (tilesButton->getToggleState()); };
+    addAndMakeVisible (*tilesButton);
+    tiles = std::make_unique<Tiles> (*this, s);
+    tileViewport.setViewedComponent (tiles.get(), false);
+    tileViewport.setScrollBarsShown (true, false);
+    tileViewport.setScrollBarThickness (11);
+    addChildComponent (tileViewport);
+    for (int i = 0; i < (int) std::size (kTileSorts); ++i)
+        sortBox.addItem ("Sort: " + juce::String (kTileSorts[i].name), i + 1);
+    sortBox.setTooltip ("How the tiles are sorted (the table's columns sort it too)");
+    sortBox.onChange = [this]
+    {
+        if (const int i = sortBox.getSelectedId() - 1; juce::isPositiveAndBelow (i, (int) std::size (kTileSorts)))
+            sortBy (kTileSorts[i].column, kTileSorts[i].forwards);
+    };
+    addChildComponent (sortBox);
+
     auto& h = table.getHeader();
     const int flags = juce::TableHeaderComponent::defaultFlags;
     h.addColumn ("FILE NAME", fileName, 210, 90, 2000, flags);
@@ -530,6 +962,7 @@ LibraryView::~LibraryView()
 {
     stopTimer();
     saveColumns();
+    tileViewport.setViewedComponent (nullptr, false);
     library.removeChangeListener (this);
     if (cloud != nullptr)
         cloud->removeChangeListener (this);
@@ -563,7 +996,9 @@ void LibraryView::showCloud (bool on)
     }
     if (cloudTable != nullptr)
         cloudTable->setVisible (on);
-    table.setVisible (! on);
+    table.setVisible (! on && ! areTilesShown());
+    tileViewport.setVisible (! on && areTilesShown());
+    tilesButton->setVisible (! on);
     pathButton.setVisible (! on);
     rescanButton.setVisible (! on);
     cleanButton.setVisible (! on);
@@ -580,6 +1015,37 @@ void LibraryView::showCloud (bool on)
     resized();
     updateStatus();
     updateInfo();
+}
+
+bool LibraryView::areTilesShown() const
+{
+    return library.areTilesShown();
+}
+
+void LibraryView::showTiles (bool on)
+{
+    library.setTilesShown (on);
+    tilesButton->setToggleState (on, juce::dontSendNotification);
+    const bool local = ! isCloudShown();
+    table.setVisible (local && ! on);
+    tileViewport.setVisible (local && on);
+    infoStale = true;
+    syncSortBox();
+    resized();
+    if (on && local)
+        tiles->scrollTo (table.getLastRowSelected());
+    else if (local)
+        table.scrollToEnsureRowIsOnscreen (juce::jmax (0, table.getLastRowSelected()));
+    repaint();
+}
+
+void LibraryView::setFilters (const std::set<Category>& categories, bool rated, bool recent)
+{
+    categoryFilter = categories;
+    ratedOnly = rated;
+    newOnly = recent;
+    refill();
+    repaint (filterArea);
 }
 
 void LibraryView::showInfo (bool on)
@@ -617,7 +1083,7 @@ void LibraryView::updateInfo()
     }
     else
     {
-        int r = rowUnderMouse (table);
+        int r = areTilesShown() ? tiles->rowUnderMouse() : rowUnderMouse (table);
         if (r < 0)
             r = table.getLastRowSelected();
         if (juce::isPositiveAndBelow (r, numRows()))
@@ -743,6 +1209,15 @@ InfoPanel::Info LibraryView::infoOf (const CloudCatalog::Entry& e) const
 
 void LibraryView::mouseMove (const juce::MouseEvent& e)
 {
+    int chip = -1;
+    for (int i = 0; i < (int) chips.size(); ++i)
+        if (chips[(size_t) i].area.contains (e.getPosition()))
+            chip = i;
+    if (chip != hoveredChip)
+    {
+        hoveredChip = chip;
+        repaint (filterArea);
+    }
     const bool over = isCloudShown() && pathArea.contains (e.getPosition());
     if (over != overSource)
     {
@@ -756,6 +1231,172 @@ void LibraryView::mouseDown (const juce::MouseEvent& e)
 {
     if (isCloudShown() && pathArea.contains (e.getPosition()))
         juce::URL (CloudCatalog::kSourcePage).launchInDefaultBrowser();
+    for (const auto& c : chips)
+        if (c.area.contains (e.getPosition()))
+            return chipClicked (c, e.mods);
+}
+
+void LibraryView::mouseExit (const juce::MouseEvent&)
+{
+    if (hoveredChip >= 0)
+    {
+        hoveredChip = -1;
+        repaint (filterArea);
+    }
+}
+
+//==============================================================================
+bool LibraryView::passesToggles (const Item& it) const
+{
+    if (ratedOnly && it.rating == 0)
+        return false;
+    if (newOnly && it.added < juce::Time::getCurrentTime() - juce::RelativeTime::days (kNewDays))
+        return false;
+    return true;
+}
+
+void LibraryView::chipClicked (const Chip& c, const juce::ModifierKeys& mods)
+{
+    switch (c.kind)
+    {
+        case Chip::all:
+            categoryFilter.clear();
+            break;
+        case Chip::category:
+            if (mods.isCommandDown() || mods.isShiftDown())
+            {
+                if (categoryFilter.erase (c.cat) == 0)
+                    categoryFilter.insert (c.cat);
+            }
+            else if (categoryFilter.size() == 1 && categoryFilter.count (c.cat) != 0)
+                categoryFilter.clear();
+            else
+                categoryFilter = { c.cat };
+            break;
+        case Chip::rated:
+            ratedOnly = ! ratedOnly;
+            break;
+        case Chip::recent:
+            newOnly = ! newOnly;
+            break;
+        case Chip::more:
+        {
+            juce::PopupMenu m;
+            juce::Component::SafePointer<LibraryView> safe (this);
+            for (const auto& hidden : moreChips)
+                m.addItem (hidden.label + "  (" + juce::String (hidden.count) + ")", true, hidden.on, [safe, hidden]
+                {
+                    if (safe != nullptr)
+                        safe->chipClicked (hidden, juce::ModifierKeys::getCurrentModifiers());
+                });
+            m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (c.area)));
+            return;
+        }
+    }
+    refill();
+    repaint (filterArea);
+}
+
+void LibraryView::layoutChips()
+{
+    chips.clear();
+    moreChips.clear();
+    hoveredChip = -1;
+    if (filterArea.isEmpty())
+        return;
+    auto area = filterArea.reduced (10, 6);
+    const auto font = theme::font (12.0f);
+    auto widthOf = [&font] (const Chip& c)
+    {
+        const auto text = c.label + (c.count >= 0 ? "  " + juce::String (c.count) : juce::String());
+        return (int) std::ceil (juce::GlyphArrangement::getStringWidth (font, text)) + (c.kind == Chip::more ? 32 : 22);
+    };
+
+    // at the right, the tiles' sort and the two that narrow any category
+    if (sortBox.isVisible())
+    {
+        sortBox.setBounds (area.removeFromRight (178));
+        area.removeFromRight (12);
+    }
+    for (auto c : { Chip { Chip::recent, Category::none, "New", -1, newOnly },
+                    Chip { Chip::rated, Category::none, juce::String (juce::CharPointer_UTF8 ("\xe2\x98\x85 Rated")), -1, ratedOnly } })
+    {
+        c.area = area.removeFromRight (widthOf (c));
+        area.removeFromRight (6);
+        chips.push_back (c);
+    }
+    area.removeFromRight (14);
+
+    // at the left, All and each category there is (none last), as many as fit: the rest under More
+    std::vector<Chip> left;
+    left.push_back ({ Chip::all, Category::none, "All", togglePassCount, categoryFilter.empty() });
+    for (int i = 0; i < FirmwareLibrary::kCategories; ++i)
+        if (const auto at = categoryCounts.find ((Category) i); at != categoryCounts.end() && at->second > 0)
+            left.push_back ({ Chip::category, (Category) i, FirmwareLibrary::categoryName ((Category) i), at->second,
+                              categoryFilter.count ((Category) i) != 0 });
+    if (const auto at = categoryCounts.find (Category::none); at != categoryCounts.end() && at->second > 0)
+        left.push_back ({ Chip::category, Category::none, "Unsorted", at->second, categoryFilter.count (Category::none) != 0 });
+
+    const Chip moreProbe { Chip::more, Category::none, "More", 99 };
+    for (size_t i = 0; i < left.size(); ++i)
+    {
+        const int w = widthOf (left[i]);
+        const bool lastOne = i + 1 == left.size();
+        if (w <= area.getWidth() - (lastOne ? 0 : widthOf (moreProbe) + 6))
+        {
+            left[i].area = area.removeFromLeft (w);
+            area.removeFromLeft (6);
+            chips.push_back (left[i]);
+            continue;
+        }
+        Chip more { Chip::more, Category::none, "More", 0 };
+        for (size_t j = i; j < left.size(); ++j)
+        {
+            moreChips.push_back (left[j]);
+            more.count += left[j].count;
+            more.on = more.on || left[j].on;
+        }
+        more.area = area.removeFromLeft (juce::jmin (area.getWidth(), widthOf (more)));
+        if (! more.area.isEmpty())
+            chips.push_back (more);
+        break;
+    }
+}
+
+void LibraryView::syncSortBox()
+{
+    for (int i = 0; i < (int) std::size (kTileSorts); ++i)
+        if (kTileSorts[i].column == sortColumn && kTileSorts[i].forwards == sortForwards)
+        {
+            sortBox.setSelectedId (i + 1, juce::dontSendNotification);
+            return;
+        }
+    sortBox.setText ("Sort: as the table's column", juce::dontSendNotification);
+}
+
+void LibraryView::editInDialog (const juce::File& file, bool url)
+{
+    const auto at = rowOf (file);
+    if (at < 0)
+        return;
+    const auto& it = itemAt (at);
+    auto* w = new juce::AlertWindow (url ? "Source URL" : "Firmware Name",
+                                     url ? "Where " + it.name() + " comes from" : "Empty: back to the name it gives itself",
+                                     juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor ("text", url ? it.url : it.name());
+    w->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<LibraryView> safe (this);
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([safe, w, file, url] (int result)
+    {
+        if (safe == nullptr || result != 1)
+            return;
+        const auto text = w->getTextEditorContents ("text");
+        if (url)
+            safe->library.setUrl (file, normalisedUrl (text));
+        else
+            safe->library.setCustomName (file, text);
+    }), true);
 }
 
 //==============================================================================
@@ -822,6 +1463,8 @@ void LibraryView::refill()
     const auto selected = selectedFiles();
     items = library.items();
     rows.clear();
+    categoryCounts.clear();
+    togglePassCount = 0;
 
     juce::StringArray words;
     words.addTokens (search.getText(), " ", "\"");
@@ -836,7 +1479,11 @@ void LibraryView::refill()
                 || it.listing.base.containsIgnoreCase (w)
                 || FirmwareLibrary::categoryName (it.shownCategory()).containsIgnoreCase (w) || it.subcategory.containsIgnoreCase (w);
         });
-        if (matches)
+        if (! matches || ! passesToggles (it))
+            continue;
+        ++togglePassCount;
+        ++categoryCounts[it.shownCategory()];
+        if (categoryFilter.empty() || categoryFilter.count (it.shownCategory()) != 0)
             rows.push_back (i);
     }
     resort();
@@ -848,6 +1495,9 @@ void LibraryView::refill()
             sel.addRange ({ r, r + 1 });
     table.setSelectedRows (sel, juce::dontSendNotification);
     table.repaint();
+    tiles->update (tileViewport.getWidth() - tileViewport.getScrollBarThickness());
+    syncSortBox();
+    layoutChips();
     updateStatus();
 }
 
@@ -970,6 +1620,9 @@ void LibraryView::updateStatus()
         emptyNote = "The library's folder is not there. Is its drive connected?";
     else if (total == 0)
         emptyNote = library.isScanning() ? "Looking through the folder..." : "No .fwsc files in this folder or under it.";
+    else if (shown == 0 && filtering())
+        emptyNote = search.getText().trim().isEmpty() ? juce::String ("No firmware passes these filters. All shows every one.")
+                                                      : "No firmware with \"" + search.getText().trim() + "\" passes these filters.";
     else if (shown == 0)
         emptyNote = "No firmware's name has \"" + search.getText().trim() + "\" in it.";
     else
@@ -1003,6 +1656,43 @@ void LibraryView::paint (juce::Graphics& g)
     g.setColour (juce::Colours::black);
     g.fillRect (bar.withTop (bar.getBottom() - 1));
     g.fillRect (foot.withHeight (1));
+
+    if (! filterArea.isEmpty())
+    {
+        g.setColour (theme::header.brighter (0.035f));
+        g.fillRect (filterArea.withTrimmedBottom (1));
+        g.setColour (juce::Colours::black);
+        g.fillRect (filterArea.withTop (filterArea.getBottom() - 1));
+        const auto chipFont = theme::font (12.0f), countFont = theme::font (11.0f);
+        for (int i = 0; i < (int) chips.size(); ++i)
+        {
+            const auto& c = chips[(size_t) i];
+            const auto r = c.area.toFloat();
+            const bool hot = i == hoveredChip;
+            g.setColour (c.on ? theme::amber : hot ? theme::tray.brighter (0.25f) : theme::tray);
+            g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
+            auto text = c.area.reduced (11, 0);
+            if (c.kind == Chip::more)
+            {
+                juce::Path arrow;
+                const auto a = juce::Rectangle<float> ((float) text.getRight() - 7.0f, r.getCentreY() - 2.0f, 7.0f, 4.0f);
+                arrow.addTriangle (a.getTopLeft(), a.getTopRight(), a.getBottomLeft().withX (a.getCentreX()));
+                g.setColour (c.on ? theme::header : theme::silk);
+                g.fillPath (arrow);
+                text.removeFromRight (10);
+            }
+            const auto labelW = (int) std::ceil (juce::GlyphArrangement::getStringWidth (chipFont, c.label));
+            g.setFont (chipFont);
+            g.setColour (c.on ? theme::header : hot ? juce::Colours::white : theme::silk);
+            g.drawText (c.label, text.removeFromLeft (labelW), juce::Justification::centredLeft, false);
+            if (c.count >= 0)
+            {
+                g.setFont (countFont);
+                g.setColour (c.on ? theme::header.withAlpha (0.7f) : theme::dimSilk);
+                g.drawText (juce::String (c.count), text, juce::Justification::centredRight, false);
+            }
+        }
+    }
 
     g.setColour (theme::dimSilk);
     g.setFont (theme::font (10.0f, true));
@@ -1054,9 +1744,13 @@ void LibraryView::resized()
         info.setBounds (b.removeFromRight (InfoPanel::kWidth));
     if (cloudTable != nullptr)
         cloudTable->setBounds (b);
+    filterArea = isCloudShown() ? juce::Rectangle<int>() : b.removeFromTop (kFilterH);
     b.removeFromBottom (kStatusH);
     table.setBounds (b);
-    note.setBounds (b.withTrimmedTop (table.getHeaderHeight() + 30).withHeight (60).reduced (24, 0));
+    tileViewport.setBounds (b);
+    tiles->update (b.getWidth() - tileViewport.getScrollBarThickness());
+    note.setBounds (b.withTrimmedTop (areTilesShown() ? 30 : table.getHeaderHeight() + 30).withHeight (60).reduced (24, 0));
+    sortBox.setVisible (areTilesShown() && ! isCloudShown());
 
     if (cloud != nullptr)
     {
@@ -1070,6 +1764,8 @@ void LibraryView::resized()
     }
     labelArea = bar.removeFromLeft (52);
     infoButton.setBounds (bar.removeFromRight (52));
+    bar.removeFromRight (6);
+    tilesButton->setBounds (bar.removeFromRight (34));
     bar.removeFromRight (8);
     search.setBounds (bar.removeFromRight (juce::jlimit (140, 260, bar.getWidth() / 3)));
     bar.removeFromRight (16);
@@ -1087,6 +1783,7 @@ void LibraryView::resized()
     }
     bar.removeFromRight (10);
     pathArea = bar;
+    layoutChips();
 }
 
 //==============================================================================
@@ -1495,6 +2192,8 @@ void LibraryView::editName (int row)
 {
     if (! juce::isPositiveAndBelow (row, numRows()))
         return;
+    if (areTilesShown())
+        return editInDialog (itemAt (row).file, false);
     editingName = itemAt (row).file;
     table.scrollToEnsureRowIsOnscreen (row);
     table.updateContent();
@@ -1504,6 +2203,8 @@ void LibraryView::editUrl (int row)
 {
     if (! juce::isPositiveAndBelow (row, numRows()))
         return;
+    if (areTilesShown())
+        return editInDialog (itemAt (row).file, true);
     table.scrollToEnsureRowIsOnscreen (row);
     if (auto* link = dynamic_cast<Link*> (table.getCellComponent (sourceUrl, row)))
         link->beginEdit();

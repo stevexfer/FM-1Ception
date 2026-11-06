@@ -11,9 +11,12 @@
     Run: ./FM1CeptionTests [firmware.fwsc]   (exit code 0 = pass)
          ./FM1CeptionTests --snapshot DIR [firmware.fwsc]   (the editor as PNGs)
          ./FM1CeptionTests --export-presets LIBRARY.json Source/CategoryPresets.cpp
+         ./FM1CeptionTests --cloud-status SUPPORT_DIR [id...]   (the Cloud's statuses, from a copy)
+         ./FM1CeptionTests --library-shot SUPPORT_DIR OUT.png [tiles|table] [category] [w] [h]
 */
 
 #include <JuceHeader.h>
+#include <iomanip>
 #include "PluginProcessor.h"
 #include "EngineView.h"
 #include "PluginEditor.h"
@@ -417,6 +420,76 @@ int exportPresets (const juce::File& db, const juce::File& out)
               << " with more than one assignment: most of theirs) to " << out.getFullPathName() << std::endl;
     return 0;
 }
+
+/** Each Cloud row's status as the library window shows it, from a copy of `support` (the
+    FM-1Ception folder: its library and kept lists), the library's own folder scanned as it is.
+    Nothing is fetched and nothing of `support` written. Rows with any of `filter` in their id. */
+int cloudStatus (const juce::File& support, const juce::StringArray& filter)
+{
+    const auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("fm1c-cloud-status");
+    tmp.deleteRecursively();
+    tmp.createDirectory();
+    for (const auto* name : { "FirmwareLibrary.json", "CloudCatalog.json", "CloudCatalog-2.json", "CloudCatalog-hub.json",
+                              "CloudCatalog-failures.json" })
+        support.getChildFile (name).copyFileTo (tmp.getChildFile (name));
+    {
+        FirmwareLibrary lib (tmp.getChildFile ("FirmwareLibrary.json"));
+        lib.rescan();
+        lib.waitForScan (120000);
+        CloudCatalog cloud (lib, tmp.getChildFile ("CloudCatalog.json"));
+        lib.dispatchPendingMessages();
+        for (const auto& e : cloud.entries())
+        {
+            if (! filter.isEmpty() && std::none_of (filter.begin(), filter.end(), [&e] (const juce::String& f) { return e.id.containsIgnoreCase (f); }))
+                continue;
+            const auto st = cloud.statusOf (e);
+            std::cout << std::left << std::setw (34) << e.key() << std::setw (16) << CloudView::statusText (st)
+                      << cloud.fileOf (e).getFileName() << (st == CloudCatalog::Status::failed ? "  (" + cloud.failureOf (e) + ")" : juce::String())
+                      << std::endl;
+        }
+    }
+    tmp.deleteRecursively();
+    return 0;
+}
+/** The library window as a PNG from a copy of `support`'s library and lists, its screens read from
+    its Screens/ (none captured): `view` "tiles" or "table", `category` a filter ("" for none). */
+int libraryShot (const juce::File& support, const juce::File& png, const juce::String& view, const juce::String& category,
+                 int width, int height)
+{
+    const auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("fm1c-library-view");
+    tmp.deleteRecursively();
+    tmp.createDirectory();
+    for (const auto* name : { "FirmwareLibrary.json", "CloudCatalog.json", "CloudCatalog-2.json", "CloudCatalog-hub.json",
+                              "CloudCatalog-failures.json" })
+        support.getChildFile (name).copyFileTo (tmp.getChildFile (name));
+    {
+        FirmwareLibrary lib (tmp.getChildFile ("FirmwareLibrary.json"));
+        lib.setCloudShown (false);
+        lib.rescan();
+        lib.waitForScan (120000);
+        CloudCatalog cloud (lib, tmp.getChildFile ("CloudCatalog.json"));
+        ScreenCache screens (support.getChildFile ("Screens"));
+        lib.dispatchPendingMessages();
+        LibraryView::Engines engines;
+        engines.count = [] { return 1; };
+        engines.selected = [] { return 0; };
+        engines.label = [] (int) { return juce::String ("Engine 1"); };
+        engines.load = [] (int, const juce::File&) {};
+        LibraryView v (lib, engines, &cloud, &screens);
+        v.setSize (width, height);
+        v.showTiles (view == "tiles");
+        if (category.isNotEmpty())
+            v.setFilters ({ FirmwareLibrary::categoryFromName (category) }, false, false);
+        v.sortBy (LibraryView::dateAdded, false);
+        const auto img = v.createComponentSnapshot (v.getLocalBounds(), true, 2.0f);
+        png.deleteFile();
+        juce::FileOutputStream out (png);
+        juce::PNGImageFormat().writeImageToStream (img, out);
+        std::cout << "wrote " << png.getFullPathName() << " (" << v.numRows() << " shown)" << std::endl;
+    }
+    tmp.deleteRecursively();
+    return 0;
+}
 } // namespace
 
 int main (int argc, char** argv)
@@ -426,6 +499,17 @@ int main (int argc, char** argv)
 
     if (argc > 3 && juce::String (argv[1]) == "--export-presets")
         return exportPresets (juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])));
+    if (argc > 2 && juce::String (argv[1]) == "--cloud-status")
+    {
+        juce::StringArray filter;
+        for (int i = 3; i < argc; ++i)
+            filter.add (juce::String::fromUTF8 (argv[i]));
+        return cloudStatus (juce::File (juce::String::fromUTF8 (argv[2])), filter);
+    }
+    if (argc > 3 && juce::String (argv[1]) == "--library-shot")
+        return libraryShot (juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])),
+                            argc > 4 ? juce::String (argv[4]) : juce::String ("tiles"), argc > 5 ? juce::String (argv[5]) : juce::String(),
+                            argc > 6 ? juce::String (argv[6]).getIntValue() : 1320, argc > 7 ? juce::String (argv[7]).getIntValue() : 820);
     if (argc > 2 && juce::String (argv[1]) == "--snapshot")
         return snapshots (juce::File (juce::String::fromUTF8 (argv[2])), findFirmware (argc - 2, argv + 2));
 
@@ -1045,16 +1129,17 @@ int main (int argc, char** argv)
         const bool haveFw = real.existsAsFile();
         if (haveFw)
             real.copyFileTo (served.getChildFile ("shrub.fwsc"));
-        served.getChildFile ("page.fwsc").replaceWithText ("<html><body>Not Found</body></html>");
+        served.getChildFile ("page-v0.9.25.fwsc").replaceWithText ("<html><body>Not Found</body></html>");
         auto urlOf = [] (const juce::File& f) { return juce::URL (f).toString (false); };
         const auto listFile = tmp.getChildFile ("list.json");
-        auto writeList = [&] (const juce::String& shrubVersion)
+        auto writeList = [&] (const juce::String& shrubVersion, const juce::String& brokenVersion = "1")
         {
             listFile.replaceWithText (
                 R"({ "firmwares": [
                     { "id": "shrub", "name": "SHRUB", "version": ")" + shrubVersion + R"(", "author": "xfer",
                       "repo": "https://github.com/xfer/FM1ShrubOS", "package": ")" + urlOf (served.getChildFile ("shrub.fwsc")) + R"(" },
-                    { "id": "broken", "name": "Broken", "version": "1", "package": ")" + urlOf (served.getChildFile ("page.fwsc")) + R"(" },
+                    { "id": "broken", "name": "Broken", "version": ")" + brokenVersion + R"(", "package": ")"
+                        + urlOf (served.getChildFile ("page-v0.9.25.fwsc")) + R"(" },
                     { "id": "installer", "name": "Installer Only", "version": "1", "installer": "https://example.com/install" },
                     { "name": "no id, skipped" }
                 ] })");
@@ -1110,6 +1195,13 @@ int main (int argc, char** argv)
             cloud.waitForIdle (30000);
             check (why.isNotEmpty() && cloud.statusOf (*broken) == Status::failed && ! folder.getChildFile ("Cloud/Broken 1.fwsc").exists(),
                    "a page that is no package is not written anywhere (" + why + ")");
+            const auto failCache = cache.getSiblingFile (cache.getFileNameWithoutExtension() + "-failures.json");
+            check (failCache.existsAsFile(),
+                   "a failed download is kept beside the list for the next session");
+            CloudCatalog again (lib, cache, { juce::URL (listFile) }, {});
+            if (const auto* b = again.find ("broken@1"))
+                check (again.statusOf (*b) == Status::failed && again.failureOf (*b).isNotEmpty(),
+                       "a new CloudCatalog loads the failure back (" + again.failureOf (*b) + ")");
         }
 
         writeList ("0.5");
@@ -1118,6 +1210,42 @@ int main (int argc, char** argv)
         if (haveFw)
             check (cloud.find ("shrub@0.5") != nullptr && cloud.statusOf (*cloud.find ("shrub@0.5")) == Status::update,
                    "a newer version of one in the library is an UPDATE");
+
+        if (haveFw)
+        {
+            // the list behind what was downloaded (the Hub's newer one), and a release its list no
+            // longer links put in the folder by hand, the list's version "latest"
+            writeList ("0.3", "latest");
+            cloud.refresh();
+            cloud.waitForIdle (30000);
+            const auto* older = cloud.find ("shrub@0.3");
+            check (older != nullptr && cloud.statusOf (*older) == Status::inLibrary
+                       && cloud.fileOf (*older) == folder.getChildFile ("Cloud/SHRUB 0.4.fwsc"),
+                   "one older than the library's download is In Library, not an UPDATE");
+
+            const auto byHand = folder.getChildFile ("Broken 0.9.45.fwsc");
+            real.copyFileTo (byHand);
+            lib.rescan();
+            lib.waitForScan (30000);
+            lib.dispatchPendingMessages();
+            const auto* latest = cloud.find ("broken@latest");
+            check (latest != nullptr && cloud.statusOf (*latest) == Status::inLibrary && cloud.fileOf (*latest) == byHand,
+                   "one put in the folder by hand, newer than the package its list links, is In Library");
+            byHand.moveFileTo (folder.getChildFile ("Broken 0.9.10.fwsc"));
+            lib.rescan();
+            lib.waitForScan (30000);
+            lib.dispatchPendingMessages();
+            check (latest != nullptr && cloud.statusOf (*latest) == Status::update,
+                   "and one older than it is an UPDATE");
+            folder.getChildFile ("Broken 0.9.10.fwsc").deleteFile();
+            lib.rescan();
+            lib.waitForScan (30000);
+            lib.dispatchPendingMessages();
+
+            writeList ("0.5");
+            cloud.refresh();
+            cloud.waitForIdle (30000);
+        }
 
         {
             CloudCatalog offline (lib, cache, { juce::URL (tmp.getChildFile ("not-there.json")) }, {});
@@ -1430,6 +1558,23 @@ int main (int argc, char** argv)
             real.copyFileTo (folder.getChildFile ("SHRUB.fwsc"));
             lib.setRoot (folder);
             lib.waitForScan (30000);
+            for (int i = 0; i < 500 && lib.numItems() == 0; ++i)
+            {
+                lib.dispatchPendingMessages();
+                juce::Thread::sleep (2);
+            }
+            const auto copied = folder.getChildFile ("SHRUB.fwsc");
+            // `lib.items()` returns by value: keep the vector so any pointer/references stay valid.
+            const auto items = lib.items();
+            const FirmwareLibrary::Item* rowItem = nullptr;
+            for (const auto& it : items)
+                if (it.file == copied)
+                {
+                    rowItem = &it;
+                    break;
+                }
+            check (rowItem != nullptr && rowItem->isPackage && rowItem->digest == digest,
+                   "the scan finds the copied package and its digest matches the probe");
             ScreenCache cache (tmp.getChildFile ("Screens"));
             LibraryView::Engines engines;
             engines.count = [] { return 1; };
@@ -1439,8 +1584,17 @@ int main (int argc, char** argv)
             LibraryView view (lib, engines, nullptr, &cache);
             view.setSize (1200, 600);
             check (view.isInfoShown() && view.infoPanel().getWidth() == InfoPanel::kWidth, "the info panel shows at the right");
-            const auto info = view.infoOf (view.itemAt (0));
-            check (info.title == "SHRUB" && info.version == "0.4" && info.shotsKey == digest && info.package.existsAsFile()
+            int row = -1;
+            for (int r = 0; r < view.numRows(); ++r)
+                if (view.itemAt (r).file == copied)
+                {
+                    row = r;
+                    break;
+                }
+            check (row >= 0, "the table lists the copied firmware");
+            const auto info = view.infoOf (view.itemAt (row));
+            check (info.title == rowItem->name() && info.version == rowItem->version() && info.shotsKey == digest
+                       && info.package.existsAsFile()
                        && std::any_of (info.facts.begin(), info.facts.end(), [] (const auto& f) { return f.first == "Added" && f.second.length() == 10; }),
                    "with what the firmware is, its dates days, its screens by its digest");
             view.setSize (700, 600);
@@ -1449,6 +1603,27 @@ int main (int argc, char** argv)
             view.showInfo (false);
             check (! view.isInfoShown() && ! lib.isInfoShown(), "INFO hides it, and the library keeps that");
             view.showInfo (true);
+
+            using Category = FirmwareLibrary::Category;
+            view.showTiles (true);
+            check (view.areTilesShown() && lib.areTilesShown() && view.numRows() == 1,
+                   "the grid button shows the firmwares as tiles, and the library keeps that");
+            lib.setCategory (copied, Category::synth);
+            lib.dispatchPendingMessages();
+            view.setFilters ({ Category::drums }, false, false);
+            check (view.numRows() == 0, "a category filter leaves out the others");
+            view.setFilters ({ Category::drums, Category::synth }, false, false);
+            check (view.numRows() == 1, "and more than one lets in each");
+            view.setFilters ({}, true, false);
+            check (view.numRows() == 0, "Rated lets in only the rated");
+            lib.setRating (copied, 3);
+            lib.dispatchPendingMessages();
+            check (view.numRows() == 1, "and one rated comes in at once");
+            view.setFilters ({}, false, true);
+            check (view.numRows() == 1, "New lets in one just added");
+            view.setFilters ({}, false, false);
+            view.showTiles (false);
+            check (! lib.areTilesShown(), "and the table comes back");
         }
         tmp.deleteRecursively();
     }

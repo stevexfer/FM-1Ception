@@ -16,7 +16,8 @@ namespace fm1c
 // lists are fetched in the background and kept beside the library's file for
 // when there is no network:
 //
-//   macOS    ~/Library/Application Support/Xfer Records/FM-1Ception/CloudCatalog.json (and -2)
+//   macOS    ~/Library/Application Support/Xfer Records/FM-1Ception/CloudCatalog.json (and -2),
+//            CloudFailures.json (the last download error per row, until the list changes)
 //
 // The Hub drops a firmware's old package when a new version comes, and
 // fm1-emu's list is only remade now and then, so the Hub's own catalog
@@ -174,6 +175,11 @@ public:
     bool waitForIdle (int timeoutMs);
 
 private:
+    struct PersistedFailure
+    {
+        juce::String fingerprint, message;
+        juce::int64 when = 0;
+    };
     struct Got
     {
         juce::MemoryBlock bytes;
@@ -199,6 +205,14 @@ private:
     void remerge (const HubIndex&);
     void finished (const Entry&, const juce::File&, const juce::String& version, const juce::String& url,
                    const juce::String& sha256, const juce::String& error);
+    juce::File failuresPath() const;
+    static juce::String fingerprintOf (const Entry&);
+    void loadPersistedFailures();
+    void savePersistedFailures() const;
+    /** Drops stale rows, merges what's left into `failures`, invalidates a row whose list metadata changed. */
+    void mergePersistedFailures();
+    void clearFailure (const juce::String& key);
+    void rememberFailure (const Entry& e, const juce::String& error);
     void reindex();
     void post (std::function<void()>);
     void handleAsyncUpdate() override;
@@ -223,9 +237,23 @@ private:
     std::map<juce::String, juce::String> refBySha;
     std::map<juce::String, juce::String> nameRefs;
     std::map<juce::String, juce::File> byKey;
-    std::map<juce::String, juce::StringArray> versionsById;
+    /** A release of an entry's firmware in the library, other than the one its list has now. */
+    struct Held
+    {
+        juce::File file;
+        juce::String version;
+        /** Downloaded as it, or its bytes one of its packages; not its file's name alone. */
+        bool exact = false;
+    };
+    std::map<juce::String, std::vector<Held>> heldById;
+    /** The newest release of it in the library at least as new as its list's, if there is one. */
+    const Held* heldCurrent (const Entry&) const;
+    /** Its version to compare against: its list's, else the one in its package's file name ("latest"). */
+    static juce::String comparableVersion (const Entry&);
     std::map<juce::String, std::vector<Done>> downloading;
     std::map<juce::String, juce::String> failures;
+    std::map<juce::String, PersistedFailure> persistedFailures;
+    bool persistedDirty = false;
 
     std::atomic<bool> quitting { false };
     juce::CriticalSection postLock;
