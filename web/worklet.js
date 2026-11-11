@@ -47,17 +47,45 @@ function budgets(mhz, frames) {
 }
 
 // The USB audio in: a computer playing a kalimba into the port (main.js decodes the samples, at
-// this context's rate). A note every 0.5-1.5x the mean interval, which the density (0..1) sets
-// from 4 s down to 0.25 s; each a random sample at a random level and place in the stereo field.
+// this context's rate: web/kalimba, tools/kalimba.py). A note every 0.5-1.5x the mean interval,
+// which the density (0..1) sets from 4 s down to 0.25 s: a random key, at a random velocity, in a
+// random place in the stereo field. The velocity picks the zone (the sample's layer): most often
+// another than the last note's, always when the key repeats, so no two notes in a row sound alike;
+// within the zone it varies the level by +-2 dB (the layers themselves get louder).
 // fm1_usb_push keeps the stream USB_AHEAD ahead of the machine's playback.
 const USB_AHEAD = 0.03;
+const ZONE_CHANGE = 0.7;
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
 class Kalimba {
   constructor() {
-    this.samples = [];
+    this.byKey = new Map();             // key -> its samples, one a zone
+    this.keys = [];
+    this.last = null;
     this.on = true;
     this.density = 0.35;
     this.voices = [];
     this.wait = 0;
+  }
+  set samples(list) {
+    this.byKey = new Map();
+    for (const s of list) {
+      s.step = Math.pow(2, s.tune / 1200);
+      if (!this.byKey.has(s.key)) this.byKey.set(s.key, []);
+      this.byKey.get(s.key).push(s);
+    }
+    this.keys = [...this.byKey.keys()];
+    this.last = null;
+  }
+  note() {
+    let key = pick(this.keys);
+    // (a key with one zone does not repeat: another key instead)
+    if (key === this.last?.key && this.byKey.get(key).length < 2) key = pick(this.keys.filter((k) => k !== key));
+    const zones = this.byKey.get(key);
+    const other = zones.filter((s) => s.zone !== this.last?.zone);
+    const s = other.length && (key === this.last?.key || Math.random() < ZONE_CHANGE) ? pick(other) : pick(zones);
+    this.last = s;
+    const pan = 0.2 + 0.6 * Math.random(), gain = 0.55 * Math.pow(10, (Math.random() * 4 - 2) / 20);
+    return { s: s.data, step: s.step, at: 0, l: gain * Math.cos(pan * Math.PI / 2), r: gain * Math.sin(pan * Math.PI / 2) };
   }
   // `frames` stereo frames at `rate` into `out` (interleaved i16)
   render(out, frames, rate) {
@@ -66,11 +94,7 @@ class Kalimba {
       if (--this.wait <= 0) {
         const mean = 4 * Math.pow(16, -this.density) * rate;
         this.wait = mean * (0.5 + Math.random());
-        if (this.on && this.samples.length && this.voices.length < 8) {
-          const pan = Math.random(), gain = 0.3 + 0.35 * Math.random();
-          this.voices.push({ s: this.samples[Math.floor(Math.random() * this.samples.length)], at: 0,
-            l: gain * Math.cos(pan * Math.PI / 2), r: gain * Math.sin(pan * Math.PI / 2) });
-        }
+        if (this.on && this.keys.length && this.voices.length < 8) this.voices.push(this.note());
       }
       let l = 0, r = 0;
       for (const v of this.voices) {
@@ -78,7 +102,7 @@ class Kalimba {
         const x = s[k] + ((s[k + 1] ?? 0) - s[k]) * f;
         l += x * v.l;
         r += x * v.r;
-        v.at += step;
+        v.at += step * v.step;
       }
       out[2 * i] = Math.max(-32767, Math.min(32767, l * 32767));
       out[2 * i + 1] = Math.max(-32767, Math.min(32767, r * 32767));

@@ -377,11 +377,10 @@ const send = (m) => node && node.port.postMessage(m);
 
 // ---------------------------------------------------------------- USB audio in: a kalimba
 // A firmware that takes a computer's audio over USB (a catalog entry's `usb`) hears a kalimba
-// from it: these samples, a random one about every 0.25-4 s as the density says (worklet.js).
+// from it: Serum 2's kalimba (web/kalimba), a note about every 0.25-4 s as the density says (worklet.js).
 const kalimbaBtn = document.getElementById("kalimba");
 const kalimbaState = document.getElementById("kalimba-state");
 const densityIn = document.getElementById("density");
-const KALIMBA = ["1", "1hi", "2", "3", "4", "5", "6", "7"].map((n) => `kalimba/tpiano-${n}.flac`);
 let kalimbaBufs = null;                    // the samples decoded at the audio context's rate
 let kalimbaOn = stored("fm1.kalimba") !== "off";
 densityIn.value = stored("fm1.density") ?? densityIn.value;
@@ -394,8 +393,10 @@ async function kalimbaLoad() {
   if (!kalimbaBufs || kalimbaBufs.rate !== ac.sampleRate) {
     kalimbaBufs = null;
     kalimbaUpdate();
-    const decoded = await Promise.all(KALIMBA.map(async (u) => ac.decodeAudioData(await (await fetch(u)).arrayBuffer())));
-    kalimbaBufs = { rate: ac.sampleRate, samples: decoded.map((b) => b.getChannelData(0)) };
+    const list = await (await fetch("kalimba/kalimba.json")).json();
+    const samples = await Promise.all(list.map(async ({ file, key, zone, tune }) => ({ key, zone, tune,
+      data: (await ac.decodeAudioData(await (await fetch(`kalimba/${file}`)).arrayBuffer())).getChannelData(0) })));
+    kalimbaBufs = { rate: ac.sampleRate, samples };
   }
   send({ type: "kalimba-samples", samples: kalimbaBufs.samples });
   kalimbaUpdate();
