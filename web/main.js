@@ -64,6 +64,15 @@ const fitPanel = () => document.documentElement.style.setProperty("--above",
   ro.observe(document.querySelector(".bar"));
 }
 fitPanel();
+// the Start button on the panel's screen: its centre and width in the stage's CSS pixels
+// (the canvas may be narrower than the stage: it is placed by its own offset and scale)
+function placeStart() {
+  const k = canvas.clientWidth / W, st = canvas.parentElement.style;
+  st.setProperty("--lcd-x", `${canvas.offsetLeft + (ui.panel_lcd_x() + 240) * k}px`);
+  st.setProperty("--lcd-y", `${canvas.offsetTop + (ui.panel_lcd_y() + 240) * k}px`);
+  st.setProperty("--lcd-w", `${480 * k}px`);
+}
+new ResizeObserver(placeStart).observe(canvas);
 
 let node = null;
 let frame = null;            // the latest LCD + LEDs from the audio thread
@@ -87,6 +96,7 @@ function setBoard(b) {
   // the synth's width follows the room left below the header and the bar (index.html's canvas rule)
   document.documentElement.style.setProperty("--aspect", String(W / H));
   document.documentElement.dataset.board = b ? "smk37" : "fm1";
+  placeStart();
   down.fill(0);
   encClicks.fill(0);
 }

@@ -620,6 +620,17 @@ pub extern "C" fn panel_height() -> u32 {
     if unsafe { PANEL_BOARD } == 1 { panel_smk::H as u32 } else { panel::H as u32 }
 }
 
+/// The screen's top left corner on the panel (it is 480 x 480: the LCD at twice its size).
+#[no_mangle]
+pub extern "C" fn panel_lcd_x() -> u32 {
+    if unsafe { PANEL_BOARD } == 1 { panel_smk::LCD_X as u32 } else { panel::LCD_X as u32 }
+}
+
+#[no_mangle]
+pub extern "C" fn panel_lcd_y() -> u32 {
+    if unsafe { PANEL_BOARD } == 1 { panel_smk::LCD_Y as u32 } else { panel::LCD_Y as u32 }
+}
+
 /// Where the page writes the LCD frame (240*240 RGB565) before `panel_draw`.
 #[no_mangle]
 #[allow(static_mut_refs)]

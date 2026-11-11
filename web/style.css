@@ -66,7 +66,9 @@ h1 { font-size: 17px; font-weight: 600; margin: 0; }
    --aspect: set by main.js; 84px: the stage's padding and the hint line), never narrower than 560px */
 canvas { display: block; width: 100%; height: auto; touch-action: none; user-select: none; margin: 0 auto;
          max-width: max(560px, calc((100svh - var(--above, 140px) - 84px) * var(--aspect, 1.56))); }
-#start { position: absolute; inset: 0; margin: auto; width: clamp(110px, 30%, 220px); height: clamp(36px, 9vw, 56px);
+/* centred on the panel's screen (main.js: --lcd-x, --lcd-y, --lcd-w) */
+#start { position: absolute; left: var(--lcd-x, 50%); top: var(--lcd-y, 50%); transform: translate(-50%, -50%);
+         width: min(clamp(110px, 30%, 220px), calc(var(--lcd-w, 400px) * .8)); height: clamp(36px, 9vw, 56px);
          border: 0; border-radius: 28px; background: var(--amber); color: #2a1a03; font-size: clamp(14px, 3.5vw, 17px);
          font-weight: 600; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
 #start:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
