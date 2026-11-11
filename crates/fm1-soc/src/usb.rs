@@ -35,7 +35,12 @@
 //! endpoint (TXCSR2 bit 6) is never NAKed: with no packet queued it sends a zero-length one
 //! and sets UnderRun (TXCSR1 bit 2), which the firmware clears with its next TXCSR1 write.
 //! The device only answers at its own address (FADDR), so a firmware that gets SET_ADDRESS
-//! wrong drops off as it would on a real bus.
+//! wrong drops off as it would on a real bus. Playback (`audio_play`, fm1-live FM1_USB_PLAY):
+//! a USB audio output's streaming interface with an isochronous OUT endpoint is played to as a
+//! computer does: SET_INTERFACE to the setting with the endpoint, then one isochronous OUT
+//! packet a frame (the rate's frames a millisecond, 16-bit stereo). An isochronous OUT endpoint
+//! (RXCSR2 bit 6) has no handshake: a packet that finds the one before unread is lost and sets
+//! OverRun (RXCSR1 bit 2), which the firmware clears by writing it 0.
 //!
 //! Not modelled: the USB interrupt. The SIE sets its flags (INTRTX / INTRRX / INTRUSB) but
 //! raises no IRQ line, so a driver that polls them (Felucca's usb.c) enumerates, and one that
@@ -98,6 +103,8 @@ struct Ep {
     setup_end: bool,
     /// Isochronous IN: an IN token found no packet queued (TXCSR1 bit 2).
     underrun: bool,
+    /// Isochronous OUT: a packet found the one before unread, and was lost (RXCSR1 bit 2).
+    overrun: bool,
 }
 
 /// What the host gets back from a transaction.
@@ -181,6 +188,16 @@ enum AudioStep {
     Off,
     SetInterface,
     SetRate,
+    Streaming,
+}
+
+/// Playing to a USB audio output: where it is in starting its stream.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[cfg_attr(feature = "state", derive(serde::Serialize, serde::Deserialize))]
+enum PlayStep {
+    #[default]
+    Off,
+    SetInterface,
     Streaming,
 }
 
@@ -276,6 +293,18 @@ pub struct Usb {
     pub audio_empty: u64,
     /// Of those, the ones where the device had nothing queued (UnderRun), not a queued empty one.
     pub audio_underruns: u64,
+    /// Playback: the PCM to play (interleaved 16-bit stereo at the stream's rate) from the frame
+    /// `play_from` on, the stream found, where it is; packets sent, and those lost to an OverRun.
+    play_pcm: Vec<i16>,
+    play_at: usize,
+    play_from: u64,
+    /// Live playback (`audio_play_push`): the stream opens without PCM and stays fed, silence
+    /// where the PCM runs short, as a computer's player that keeps its output open.
+    play_live: bool,
+    pub play_stream: Option<AudioStream>,
+    play_step: PlayStep,
+    pub play_packets: u64,
+    pub play_overruns: u64,
     pub events: Vec<UsbEvent>,
     /// FM1_USB_TRACE: the host's transactions on stderr.
     #[cfg_attr(feature = "state", serde(skip))]
@@ -309,6 +338,46 @@ impl Usb {
     /// program would, from when it is configured on.
     pub fn audio_record(&mut self, rate: u32) {
         self.audio_want = Some(rate);
+    }
+
+    /// Play `pcm` (interleaved 16-bit stereo, at the rate of the device's playback stream) to the
+    /// device's USB audio output (if it has one), as a computer would, from `from_ms` after the
+    /// cable went in.
+    pub fn audio_play(&mut self, pcm: Vec<i16>, from_ms: u64) {
+        self.play_pcm = pcm;
+        self.play_at = 0;
+        self.play_from = from_ms;
+        self.play_live = false;
+    }
+
+    /// Live playback: add `pcm` (interleaved 16-bit stereo at the stream's rate, `play_rate`) to
+    /// what is still to be played. The first call opens the stream for good; from then on a
+    /// frame with too little PCM is filled with silence.
+    pub fn audio_play_push(&mut self, pcm: &[i16]) {
+        if !self.play_live {
+            self.play_live = true;
+            self.play_pcm.clear();
+            self.play_at = 0;
+            self.play_from = 0;
+        }
+        if self.play_at >= 1 << 16 {
+            self.play_pcm.drain(..self.play_at);
+            self.play_at = 0;
+        }
+        self.play_pcm.extend_from_slice(pcm);
+    }
+
+    /// The playback stream's rate once it streams (0: not yet, or the device has none).
+    pub fn play_rate(&self) -> u32 {
+        match (&self.play_stream, self.play_step) {
+            (Some(a), PlayStep::Streaming) => a.default_rate(),
+            _ => 0,
+        }
+    }
+
+    /// Stereo frames pushed and not yet played.
+    pub fn play_queued(&self) -> usize {
+        (self.play_pcm.len() - self.play_at) / 2
     }
 
     fn con0(&self) -> u32 {
@@ -446,7 +515,7 @@ impl Usb {
             S_CSR0 => e.tx_rdy as u8 | (e.underrun as u8) << 2 | (e.stall as u8) << 4 | (e.sent_stall as u8) << 5,
             S_TXCSR2 => e.txcsr2,
             S_RXMAXP => e.rxmaxp,
-            S_RXCSR1 => e.rx_rdy as u8 | (e.stall as u8) << 5 | (e.sent_stall as u8) << 6,
+            S_RXCSR1 => e.rx_rdy as u8 | (e.overrun as u8) << 2 | (e.stall as u8) << 5 | (e.sent_stall as u8) << 6,
             S_RXCSR2 => e.rxcsr2,
             S_COUNT0 => e.rx_count as u8,
             S_RXCOUNT2 => (e.rx_count >> 8) as u8,
@@ -509,6 +578,9 @@ impl Usb {
                 // FlushFIFO or RxPktRdy written 0: the packet is taken
                 if v & 0x10 != 0 || v & 1 == 0 {
                     e.rx_rdy = false;
+                }
+                if v & 0x04 == 0 {
+                    e.overrun = false; // (written 0)
                 }
                 e.stall = v & 0x20 != 0;
                 if v & 0x40 == 0 {
@@ -656,11 +728,17 @@ impl Usb {
             return Reply::Nak;
         }
         let e = &mut self.ep[n];
-        if e.stall {
+        let iso = e.rxcsr2 & 0x40 != 0;
+        if e.stall && !iso {
             e.sent_stall = true;
             return Reply::Stall;
         }
         if e.rx_rdy {
+            if iso {
+                e.overrun = true; // no handshake: the packet is lost
+                self.play_overruns += 1;
+                return Reply::Silent;
+            }
             return Reply::Nak;
         }
         let at = self.radr(n);
@@ -727,6 +805,7 @@ impl Usb {
                 self.ctl = None;
                 self.out_q.clear();
                 self.audio_step = AudioStep::Off;
+                self.play_step = PlayStep::Off;
             }
             return;
         }
@@ -752,6 +831,7 @@ impl Usb {
             HostState::Configured => {
                 self.midi_frame(dma);
                 self.audio_frame(dma);
+                self.play_frame(dma);
             }
             _ => {}
         }
@@ -888,6 +968,12 @@ impl Usb {
                 self.find_midi();
                 self.audio_stream = find_audio(&self.conf);
                 self.audio_step = AudioStep::Off;
+                self.play_stream = find_playback(&self.conf);
+                self.play_step = PlayStep::Off;
+                if let Some(a) = &self.play_stream {
+                    self.log(|| format!("playback: IF {} alt {} ep {:#04x}, {} ch x {} B, {:?} Hz, max packet {}", a.interface,
+                                        a.alt, a.ep, a.channels, a.sample_bytes, a.rates, a.max_packet));
+                }
                 let vid = u16::from_le_bytes([self.dev_desc[8], self.dev_desc[9]]);
                 let pid = u16::from_le_bytes([self.dev_desc[10], self.dev_desc[11]]);
                 self.log(|| format!("configured: \"{}\" {vid:04x}:{pid:04x}, MIDI OUT ep {} IN ep {}",
@@ -1030,6 +1116,91 @@ impl Usb {
             }
         }
     }
+}
+
+impl Usb {
+    /// Playback's part of a frame: SET_INTERFACE once the recording (if any) has started and
+    /// `play_from` has come, then one isochronous OUT packet a frame until the PCM ends.
+    fn play_frame(&mut self, dma: &mut dyn Dma) {
+        let Some(a) = self.play_stream.clone() else { return };
+        match self.play_step {
+            PlayStep::Off => {
+                let busy = matches!(self.audio_step, AudioStep::SetInterface | AudioStep::SetRate);
+                let have = self.play_live || self.play_at < self.play_pcm.len();
+                if have && self.frames >= self.play_from && !busy && self.ctl.is_none() {
+                    self.ctl = Some(Ctl { setup: [0x01, 0x0b, a.alt, 0, a.interface, 0, 0, 0], ..Default::default() });
+                    self.play_step = PlayStep::SetInterface;
+                }
+            }
+            PlayStep::SetInterface => match self.control(dma) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    self.log(|| format!("playback: streaming at {} Hz", a.default_rate()));
+                    self.play_step = PlayStep::Streaming;
+                }
+                Err(e) => {
+                    self.log(|| format!("playback: {e}"));
+                    self.ctl = None;
+                    self.play_pcm.clear();
+                    self.play_step = PlayStep::Off;
+                }
+            },
+            PlayStep::Streaming => {
+                // a frame's share of the rate (44.1 kHz: 44 frames, every tenth 45)
+                let (rate, k) = (a.default_rate() as u64, self.play_packets);
+                let want = ((rate * (k + 1) / 1000 - rate * k / 1000) * 2) as usize;
+                let n = want.min(self.play_pcm.len() - self.play_at);
+                if n == 0 && !self.play_live {
+                    return; // (the PCM is over: the stream stays open, with no packets, as a paused player's)
+                }
+                let mut data: Vec<u8> = self.play_pcm[self.play_at..self.play_at + n].iter().flat_map(|s| s.to_le_bytes()).collect();
+                if self.play_live {
+                    data.resize(want * 2, 0);
+                }
+                self.play_at += n;
+                self.play_packets += 1;
+                let addr = self.addr;
+                self.dev_out(dma, addr, (a.ep & 0xf) as usize, &data);
+            }
+        }
+    }
+}
+
+/// The playback interface of a configuration: the first alternate setting of an audio streaming
+/// interface (class 1, subclass 2) with an isochronous OUT endpoint, and its Type I format.
+pub fn find_playback(conf: &[u8]) -> Option<AudioStream> {
+    let mut i = 0usize;
+    let mut cur: Option<AudioStream> = None;
+    while i + 2 <= conf.len() {
+        let (len, ty) = (conf[i] as usize, conf[i + 1]);
+        if len < 2 || i + len > conf.len() {
+            break;
+        }
+        let d = &conf[i..i + len];
+        match ty {
+            4 if len >= 9 => {
+                if cur.as_ref().is_some_and(|a| a.ep != 0) {
+                    break;
+                }
+                cur = (d[5] == 1 && d[6] == 2).then(|| AudioStream { interface: d[2], alt: d[3], ..Default::default() });
+            }
+            0x24 if len >= 11 && d[2] == 2 && d[3] == 1 => {
+                if let Some(a) = cur.as_mut() {
+                    (a.channels, a.sample_bytes) = (d[4], d[5]);
+                    let at = |k: usize| u32::from(d[k]) | u32::from(d[k + 1]) << 8 | u32::from(d[k + 2]) << 16;
+                    a.rates = (0..d[7] as usize).filter(|k| 8 + 3 * k + 3 <= len).map(|k| at(8 + 3 * k)).collect();
+                }
+            }
+            5 if len >= 7 && d[3] & 3 == 1 && d[2] & 0x80 == 0 => {
+                if let Some(a) = cur.as_mut() {
+                    (a.ep, a.max_packet) = (d[2], u16::from_le_bytes([d[4], d[5]]));
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    cur.filter(|a| a.ep != 0 && a.channels == 2 && a.sample_bytes == 2 && a.default_rate() != 0)
 }
 
 /// The audio streaming interface (class 1, subclass 2) of a configuration: the first

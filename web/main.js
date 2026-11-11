@@ -213,6 +213,7 @@ let loadedUrl = null;                      // the package the running machine ca
 
 function showFirmware() {
   title.textContent = `${DEV.product} · ${fw.name} (emulated)`;
+  document.getElementById("usbin").hidden = !fw.usb;
   for (const [id, card] of cards) {
     card.classList.toggle("on", id === fw.id);
     card.querySelector("button").textContent = id === fw.id ? "Selected" : "Play";
@@ -273,7 +274,8 @@ fwSel.addEventListener("change", () => {
   if (!EMBED) store(DEV.key + "fw", fw.id);
   showFirmware();
   fwSel.blur();                 // back to playing from the keyboard
-  if (node) boot();
+  // (a firmware whose codec runs at another rate gets an audio context at that rate)
+  if (node) ac.sampleRate === rateOf(fw) ? boot() : rebuildAudio();
 });
 mhzSel.addEventListener("change", () => {
   mhz = Number(mhzSel.value);
@@ -362,6 +364,41 @@ requestAnimationFrame(draw);
 
 // ---------------------------------------------------------------- input to the machine
 const send = (m) => node && node.port.postMessage(m);
+
+// ---------------------------------------------------------------- USB audio in: a kalimba
+// A firmware that takes a computer's audio over USB (a catalog entry's `usb`) hears a kalimba
+// from it: these samples, a random one about every 0.25-4 s as the density says (worklet.js).
+const kalimbaBtn = document.getElementById("kalimba");
+const kalimbaState = document.getElementById("kalimba-state");
+const densityIn = document.getElementById("density");
+const KALIMBA = ["1", "1hi", "2", "3", "4", "5", "6", "7"].map((n) => `kalimba/tpiano-${n}.flac`);
+let kalimbaBufs = null;                    // the samples decoded at the audio context's rate
+let kalimbaOn = stored("fm1.kalimba") !== "off";
+densityIn.value = stored("fm1.density") ?? densityIn.value;
+function kalimbaUpdate() {
+  kalimbaBtn.setAttribute("aria-pressed", String(kalimbaOn));
+  kalimbaState.textContent = !kalimbaBufs ? "loading…" : kalimbaOn ? "playing" : "off";
+  send({ type: "kalimba", on: kalimbaOn, density: Number(densityIn.value) });
+}
+async function kalimbaLoad() {
+  if (!kalimbaBufs || kalimbaBufs.rate !== ac.sampleRate) {
+    kalimbaBufs = null;
+    kalimbaUpdate();
+    const decoded = await Promise.all(KALIMBA.map(async (u) => ac.decodeAudioData(await (await fetch(u)).arrayBuffer())));
+    kalimbaBufs = { rate: ac.sampleRate, samples: decoded.map((b) => b.getChannelData(0)) };
+  }
+  send({ type: "kalimba-samples", samples: kalimbaBufs.samples });
+  kalimbaUpdate();
+}
+kalimbaBtn.addEventListener("click", () => {
+  kalimbaOn = !kalimbaOn;
+  store("fm1.kalimba", kalimbaOn ? "on" : "off");
+  kalimbaUpdate();
+});
+densityIn.addEventListener("input", () => {
+  store("fm1.density", densityIn.value);
+  kalimbaUpdate();
+});
 function setKey(id, on) {
   if (down[id] === (on ? 1 : 0)) return;
   down[id] = on ? 1 : 0;
@@ -733,11 +770,18 @@ function setClock(c) {
   boot();
 }
 async function setLatency(l) {
+  // a larger buffer needs a new audio context
+  await rebuildAudio(() => {
+    latency = l;
+    store("fm1.latency", l);
+  });
+}
+
+// a new audio context (and `change` made once the running machine is saved): rebuild the graph, boot again
+async function rebuildAudio(change = () => {}) {
   await bootQueue;
   await flushRunning(true);
-  latency = l;
-  store("fm1.latency", l);
-  // a larger buffer needs a new audio context: rebuild the graph, boot again
+  change();
   node.port.onmessage = null;
   node.disconnect();
   running = null;
@@ -857,10 +901,11 @@ function boot(options = {}) {
       });
       node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
         sectors: packSectors(sectors).buffer, syx: importedBank ? importedBank.slice().buffer : null,
-        mhz: clock, jit: params.get("jit") !== "0",
+        mhz: clock, jit: params.get("jit") !== "0", usb: !!f.usb, frameNs: f.frameNs || 0,
         // (?ahead=0: each quantum emulates only for its own frames, as before the even pace)
         ahead: params.has("ahead") ? Number(params.get("ahead")) : undefined });
       status.textContent = `booting ${f.name}…`;
+      if (f.usb) kalimbaLoad().catch((e) => { kalimbaState.textContent = `no samples: ${e.message}`; });
       await ready;
       if (bank === importedBank) bank = null; // imports seed flash once; saved edits win on later boots
       return true;
@@ -878,8 +923,10 @@ function boot(options = {}) {
 }
 
 // the audio graph: a context with the chosen buffer, the emulator's worklet node in it
+// the rate a firmware's audio runs at: its catalog entry's `rate`, or the stock 44.1 kHz
+const rateOf = (f) => f.rate || 44100;
 async function startAudio() {
-  ac = new AudioContext({ sampleRate: 44100, latencyHint: latency });
+  ac = new AudioContext({ sampleRate: rateOf(fw), latencyHint: latency });
   await ac.audioWorklet.addModule("worklet.js");
   node = new AudioWorkletNode(ac, "fm1", { numberOfInputs: 0, outputChannelCount: [2] });
   node.connect(ac.destination);

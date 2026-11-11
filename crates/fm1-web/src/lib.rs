@@ -39,9 +39,13 @@ struct Machine {
     pace: Pace,
 }
 
-/// The audio rate the page plays at (the AudioContext's, and the firmwares' I2S): a quantum of
-/// `frames` stands for `frames * hz / AUDIO_HZ` emulated cycles.
-const AUDIO_HZ: i64 = 44_100;
+/// The audio rate the page plays at (the AudioContext's, and the firmware's I2S: `fm1_audio_rate`):
+/// a quantum of `frames` stands for `frames * hz / audio_hz()` emulated cycles.
+static mut AUDIO_HZ: u32 = 44_100;
+
+fn audio_hz() -> i64 {
+    unsafe { AUDIO_HZ as i64 }
+}
 
 /// fm1_render's pace. Without it a quantum runs the machine only when the queue is short of the
 /// quantum's frames, so a firmware whose DMA hands out its audio in 256- or 512-frame half
@@ -85,7 +89,7 @@ impl Pace {
 
     /// A chunk ran `cycles` of emulated time and delivered `arrived` frames in `halves` half buffers.
     fn ran(&mut self, cycles: u64, arrived: usize, halves: u64) {
-        self.credit -= cycles as i64 * AUDIO_HZ;
+        self.credit -= cycles as i64 * audio_hz();
         if halves > 0 {
             self.burst = self.burst.max(arrived / halves as usize);
         }
@@ -100,7 +104,7 @@ impl Pace {
         if ahead == 0 || self.burst <= frames {
             return 0;
         }
-        (self.burst - ahead.min(self.burst) + frames * 3 / 2) as u64 * hz / AUDIO_HZ as u64
+        (self.burst - ahead.min(self.burst) + frames * 3 / 2) as u64 * hz / audio_hz() as u64
     }
 
     /// The quantum is over. Time run because the queue was short is not owed back: that is
@@ -118,6 +122,7 @@ impl Machine {
         let mut soc = Soc::new(RAM_SIZE, image);
         soc.periph.hz = mhz as u64 * 1_000_000;
         soc.periph.skip_idle = true;
+        soc.periph.frame_ns = match unsafe { FRAME_NS } { 0 => None, ns => Some(ns as u64) };
         let mut cpu = Cpu::new(entry);
         // (cpu1 follows cpu0's setting: run_dual)
         cpu.jit_on = unsafe { JIT };
@@ -196,6 +201,8 @@ static mut OUT_R: [f32; 1024] = [0.0; 1024];
 static mut LEDS: [f32; 41] = [0.0; 41];
 static mut PADS: [u32; 16] = [0; 16];
 static mut INSNS: u64 = 0;
+static mut FRAME_NS: u32 = 0;
+static mut USB_BUF: [i16; 2048] = [0; 2048];
 
 #[allow(static_mut_refs)]
 fn machine() -> Option<&'static mut Machine> {
@@ -389,6 +396,61 @@ pub extern "C" fn fm1_out_l() -> *const f32 {
 pub extern "C" fn fm1_out_r() -> *const f32 {
     #[allow(static_mut_refs)]
     unsafe { OUT_R.as_ptr() }
+}
+
+/// The rate the page's audio runs at, before a boot (default 44100).
+#[no_mangle]
+pub extern "C" fn fm1_audio_rate(hz: u32) {
+    unsafe { AUDIO_HZ = hz.clamp(8000, 192_000) };
+}
+
+/// An I2S frame's time in ns for a firmware that clocks its codec at another rate than the stock
+/// 44.1 kHz (fm1_soc's `frame_ns`; 0: the stock rate), from the next boot on.
+#[no_mangle]
+pub extern "C" fn fm1_audio_frame_ns(ns: u32) {
+    unsafe { FRAME_NS = ns };
+    if let Some(m) = machine() {
+        m.soc.periph.frame_ns = (ns > 0).then_some(ns as u64);
+    }
+}
+
+/// Plug a computer into the USB port: it enumerates the firmware's device and, if it has an audio
+/// output (the computer's playback), streams `fm1_usb_push`'s PCM to it.
+#[no_mangle]
+pub extern "C" fn fm1_usb_plug() {
+    if let Some(m) = machine() {
+        m.soc.usb_plug();
+    }
+}
+
+/// The computer's playback rate once its stream is open (0: not yet, or none).
+#[no_mangle]
+pub extern "C" fn fm1_usb_play_rate() -> u32 {
+    machine().map_or(0, |m| m.soc.usb.play_rate())
+}
+
+/// Stereo frames pushed and not yet sent.
+#[no_mangle]
+pub extern "C" fn fm1_usb_play_queued() -> u32 {
+    machine().map_or(0, |m| m.soc.usb.play_queued() as u32)
+}
+
+/// Where the page writes up to 2048 interleaved L/R samples for `fm1_usb_push`.
+#[no_mangle]
+pub extern "C" fn fm1_usb_buf() -> *mut i16 {
+    #[allow(static_mut_refs)]
+    unsafe { USB_BUF.as_mut_ptr() }
+}
+
+/// Hand the first `frames` stereo frames of `fm1_usb_buf` to the computer's playback; from the
+/// first push on, its stream stays open and plays silence when they run out.
+#[no_mangle]
+pub extern "C" fn fm1_usb_push(frames: u32) {
+    let n = (frames as usize * 2).min(2048);
+    if let Some(m) = machine() {
+        #[allow(static_mut_refs)]
+        m.soc.usb.audio_play_push(unsafe { &USB_BUF[..n] });
+    }
 }
 
 /// The 240x240 RGB565 framebuffer.
@@ -818,7 +880,7 @@ mod pace_tests {
             if queued > 0 && !playing {
                 playing = true;
                 if capped && ahead > 0 {
-                    budget = frames as u64 * 3 / 2 * hz / AUDIO_HZ as u64;
+                    budget = frames as u64 * 3 / 2 * hz / audio_hz() as u64;
                 }
             }
             if playing && queued < frames {
@@ -826,7 +888,7 @@ mod pace_tests {
             }
             queued = queued.saturating_sub(frames);
             if q > 100 {
-                worst = worst.max((t - t0) as f64 / (frames as u64 * hz / AUDIO_HZ as u64) as f64);
+                worst = worst.max((t - t0) as f64 / (frames as u64 * hz / audio_hz() as u64) as f64);
                 deepest = deepest.max(queued);
             }
         }
@@ -845,7 +907,7 @@ mod pace_tests {
                 assert!(bursty > (half / 128) as f64 - 0.6, "{half} at {hz}: {bursty}");
                 // with: about one share (plus the chunks idle skipping stretches), and at most a
                 // half buffer and a quantum queued ahead
-                assert!(even < 1.6 + 300_000.0 * AUDIO_HZ as f64 / (128 * hz) as f64, "{half} at {hz}: {even}");
+                assert!(even < 1.6 + 300_000.0 * audio_hz() as f64 / (128 * hz) as f64, "{half} at {hz}: {even}");
                 assert!(deepest <= half + 128, "{half} at {hz}: {deepest} frames ahead");
             }
         }

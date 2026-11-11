@@ -126,6 +126,9 @@ select:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
 .file input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 #midiact { width: 8px; height: 8px; border-radius: 50%; background: var(--line); flex: none; }
 #midiact.on { background: var(--amber); }
+#kalimba { display: inline-flex; align-items: center; gap: 7px; }
+#kalimba[aria-pressed="true"] { border-color: var(--amber); color: var(--amber-hi); }
+#density { width: 62%; accent-color: var(--amber); }
 #save-status { color: var(--text); font-size: 14px; }
 #save-status[data-error="true"] { color: var(--amber); }
 .save-controls { margin: 0; padding: 0 12px; border: 1px solid var(--rule); border-radius: 10px; background: var(--room); }

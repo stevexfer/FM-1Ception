@@ -243,6 +243,11 @@ pub struct Periph {
     /// runner's setting, not the chip's: not in a save-state.
     #[cfg_attr(feature = "state", serde(skip))]
     pub midi_speed: u64,
+    /// An I2S frame's time in ns, for a firmware that sets the codec's clock to another rate than
+    /// the stock one, which is not read from its registers (20800: 160 MHz / 13 / 256, 48,076.9 Hz;
+    /// fm1-live: FM1_AUDIO_FRAME_NS); None: the stock rate. The runner's setting: not in a save-state.
+    #[cfg_attr(feature = "state", serde(skip))]
+    pub frame_ns: Option<u64>,
     // key matrix
     sr_shift: u16,
     sr_latched: u16,
@@ -393,6 +398,7 @@ impl Default for Periph {
             uart: Uart { next: u64::MAX, ot_next: u64::MAX, ..Default::default() },
             uart_irq: false,
             midi_speed: 1,
+            frame_ns: None,
             sr_shift: 0xffff,
             sr_latched: 0xffff,
             pa_out: 0,
@@ -472,7 +478,11 @@ impl Periph {
     }
 
     fn half_period(&self) -> u64 {
-        (self.alnk_len.max(2) as u64 / 2 * FRAME_T4 * self.hz / T4_HZ).max(1)
+        let frames = self.alnk_len.max(2) as u64 / 2;
+        match self.frame_ns {
+            Some(ns) => (frames * ns * self.hz / 1_000_000_000).max(1),
+            None => (frames * FRAME_T4 * self.hz / T4_HZ).max(1),
+        }
     }
 
     fn enc_step(&self) -> u64 {
@@ -626,6 +636,7 @@ impl Periph {
             usb_period: old.usb_period,
             uart,
             midi_speed: old.midi_speed,
+            frame_ns: old.frame_ns,
             sr_shift: old.sr_shift,
             sr_latched: old.sr_latched,
             led_acc: old.led_acc,

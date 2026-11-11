@@ -46,6 +46,48 @@ function budgets(mhz, frames) {
   return { boot: mhz * 1e6 * 0.02, play: mhz * 1e6 * 1.5 * frames / sampleRate };
 }
 
+// The USB audio in: a computer playing a kalimba into the port (main.js decodes the samples, at
+// this context's rate). A note every 0.5-1.5x the mean interval, which the density (0..1) sets
+// from 4 s down to 0.25 s; each a random sample at a random level and place in the stereo field.
+// fm1_usb_push keeps the stream USB_AHEAD ahead of the machine's playback.
+const USB_AHEAD = 0.03;
+class Kalimba {
+  constructor() {
+    this.samples = [];
+    this.on = true;
+    this.density = 0.35;
+    this.voices = [];
+    this.wait = 0;
+  }
+  // `frames` stereo frames at `rate` into `out` (interleaved i16)
+  render(out, frames, rate) {
+    const step = sampleRate / rate;
+    for (let i = 0; i < frames; i++) {
+      if (--this.wait <= 0) {
+        const mean = 4 * Math.pow(16, -this.density) * rate;
+        this.wait = mean * (0.5 + Math.random());
+        if (this.on && this.samples.length && this.voices.length < 8) {
+          const pan = Math.random(), gain = 0.3 + 0.35 * Math.random();
+          this.voices.push({ s: this.samples[Math.floor(Math.random() * this.samples.length)], at: 0,
+            l: gain * Math.cos(pan * Math.PI / 2), r: gain * Math.sin(pan * Math.PI / 2) });
+        }
+      }
+      let l = 0, r = 0;
+      for (const v of this.voices) {
+        const k = v.at | 0, f = v.at - k, s = v.s;
+        const x = s[k] + ((s[k + 1] ?? 0) - s[k]) * f;
+        l += x * v.l;
+        r += x * v.r;
+        v.at += step;
+      }
+      out[2 * i] = Math.max(-32767, Math.min(32767, l * 32767));
+      out[2 * i + 1] = Math.max(-32767, Math.min(32767, r * 32767));
+    }
+    this.voices = this.voices.filter((v) => v.at < v.s.length - 1);
+  }
+  get busy() { return this.on || this.voices.length > 0; }
+}
+
 // the wall clock, for how long each quantum's emulation takes (where an AudioWorklet has no
 // performance.now(), Date.now(): whole milliseconds, which still average out over a second)
 const now = globalThis.performance?.now ? () => performance.now() : () => Date.now();
@@ -57,6 +99,7 @@ class Fm1 extends AudioWorkletProcessor {
     this.calls = 0;
     this.bootToken = 0;
     this.snapshots = [];
+    this.kalimba = new Kalimba();
     this.port.onmessageerror = () => this.port.postMessage({ type: "error", message: "a message could not be read" });
     this.port.onmessage = async (e) => {
       const m = e.data;
@@ -70,6 +113,11 @@ class Fm1 extends AudioWorkletProcessor {
           this.paused = false;
           this.port.postMessage({ type: "error", seq: m.seq, message: `boot: ${err}` });
         }
+      } else if (m.type === "kalimba-samples") {
+        this.kalimba.samples = m.samples;
+      } else if (m.type === "kalimba") {
+        this.kalimba.on = m.on;
+        this.kalimba.density = m.density;
       } else if (m.type === "cancel-boot") {
         ++this.bootToken;
         this.x = null;
@@ -113,6 +161,9 @@ class Fm1 extends AudioWorkletProcessor {
       new Uint8Array(x.memory.buffer, p, buf.byteLength).set(new Uint8Array(buf));
       return p;
     };
+    // a firmware that clocks its codec at another rate than the stock 44.1 kHz (this context runs at it)
+    x.fm1_audio_rate?.(sampleRate);
+    x.fm1_audio_frame_ns?.(m.frameNs || 0);
     const pkg = copy(m.package);
     if (x.fm1_boot_fwsc(pkg, m.package.byteLength, 0, 0, m.mhz) !== 0) {
       throw new Error("not an FM-1 update package (or a DX7 bank it cannot use)");
@@ -123,6 +174,13 @@ class Fm1 extends AudioWorkletProcessor {
     if (m.syx && x.fm1_load_syx(copy(m.syx), m.syx.byteLength) === 1) {
       throw new Error("this firmware cannot load that DX7 bank");
     }
+    // a computer on the USB port, its playback stream open from the start (silence until fed)
+    this.usb = !!(m.usb && x.fm1_usb_plug);
+    if (this.usb) {
+      x.fm1_usb_plug();
+      x.fm1_usb_push(0);
+    }
+    this.kalimba.voices = [];
     this.x = x;                         // (a reboot replaces the whole instance)
     this.mhz = m.mhz;
     this.ahead = ahead;
@@ -188,6 +246,17 @@ class Fm1 extends AudioWorkletProcessor {
     }
   }
 
+  // top the computer's playback up to USB_AHEAD at its stream's rate
+  feedUsb(x) {
+    const rate = x.fm1_usb_play_rate();
+    if (!rate || !this.kalimba.busy) return;
+    const frames = Math.min(1024, Math.round(rate * USB_AHEAD) - x.fm1_usb_play_queued());
+    if (frames <= 0) return;
+    const buf = new Int16Array(x.memory.buffer, x.fm1_usb_buf(), 2048);
+    this.kalimba.render(buf, frames, rate);
+    x.fm1_usb_push(frames);
+  }
+
   process(_inputs, outputs) {
     const out = outputs[0];
     const x = this.x;
@@ -197,6 +266,7 @@ class Fm1 extends AudioWorkletProcessor {
     const t0 = now();
     let have;
     try {
+      if (this.usb) this.feedUsb(x);
       have = x.fm1_render(n, this.budget);
     } catch (err) {                       // a trap in the emulator: stop and say so
       this.x = null;

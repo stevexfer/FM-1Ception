@@ -29,6 +29,8 @@
 //! Headless (`--shot`): FM1_USB_SEND='MS:HEX…;MS:HEX…' sends those MIDI messages over USB at
 //! those times, and what comes back is printed. FM1_USB_WAV=FILE (`--bench` or `--shot`): the
 //! computer records the device's USB audio into FILE (FM1_USB_RATE: at that rate).
+//! FM1_USB_PLAY=FILE: the computer plays FILE (s16le stereo, no header, at the rate of the
+//! device's USB audio output) to it, from FM1_USB_PLAY_AT ms on.
 //!
 //! `--flaky-core1 RATE [--seed N]`: core 1 misreads RAM now and then, as on some units
 //! (fm1_soc::flaky), for trying a firmware's fallback to one core.
@@ -195,6 +197,7 @@ impl Machine {
         let mut soc = Soc::new(RAM_SIZE, image);
         soc.periph.hz = o.mhz * 1_000_000;
         soc.periph.skip_idle = true;
+        soc.periph.frame_ns = std::env::var("FM1_AUDIO_FRAME_NS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0);
         soc.flaky_core1 = o.flaky_core1.map(|rate| fm1_soc::flaky::FlakyCore1::new(rate, o.seed.unwrap_or(1)));
         let mut cpu = Cpu::new(stock.as_ref().map_or(o.entry, |st| st.entry));
         cpu.jit_on = std::env::var("FM1_NO_JIT").is_err();
@@ -352,8 +355,10 @@ fn bench(o: &Opts, ms: u64) {
         let mut v: Vec<_> = pcs.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         let tot: u64 = v.iter().map(|x| x.1).sum();
-        for (pc, n) in v.iter().take(25) {
-            println!("pc {pc:#010x} {:5.1}%", 100.0 * *n as f64 / tot as f64);
+        // FM1_BENCH_PCS=N: the N most sampled (any other value: 25)
+        let top = std::env::var("FM1_BENCH_PCS").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 1).unwrap_or(25);
+        for (pc, n) in v.iter().take(top) {
+            println!("pc {pc:#010x} {:5.1}% {n}", 100.0 * *n as f64 / tot as f64);
         }
     }
     let wall = t.elapsed().as_secs_f64();
@@ -654,6 +659,15 @@ fn usb_script() -> VecDeque<(u64, Vec<u8>)> {
 /// --usb with FM1_USB_WAV=FILE (--bench, --shot): the computer records the device's USB audio,
 /// asking for FM1_USB_RATE (default 44100).
 fn usb_audio_arm(m: &mut Machine) {
+    if let (Ok(path), true) = (std::env::var("FM1_USB_PLAY"), m.soc.usb.cable) {
+        match std::fs::read(&path) {
+            Ok(b) => {
+                let at = std::env::var("FM1_USB_PLAY_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                m.soc.usb.audio_play(b.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect(), at);
+            }
+            Err(e) => eprintln!("FM1_USB_PLAY {path}: {e}"),
+        }
+    }
     if std::env::var_os("FM1_USB_WAV").is_some() && m.soc.usb.cable {
         let rate = std::env::var("FM1_USB_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(44_100);
         m.soc.usb.audio_record(rate);
@@ -663,6 +677,14 @@ fn usb_audio_arm(m: &mut Machine) {
 /// --usb with FM1_USB_WAV=FILE: what the computer recorded from the device's USB audio (the
 /// samples as sent, interleaved as its channels come, s16le, no header).
 fn usb_audio_save(m: &Machine) {
+    if std::env::var_os("FM1_USB_PLAY").is_some() {
+        let u = &m.soc.usb;
+        match &u.play_stream {
+            Some(a) => println!("usb playback: {} Hz to ep {:#04x}, {} packets sent, {} lost (the one before unread)",
+                                a.default_rate(), a.ep, u.play_packets, u.play_overruns),
+            None => println!("usb playback: the device has no USB audio output"),
+        }
+    }
     let Ok(path) = std::env::var("FM1_USB_WAV") else { return };
     let u = &m.soc.usb;
     if !u.cable {
@@ -890,6 +912,9 @@ env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted i
      FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)
      FM1_USB_SEND='MS:HEX;…'  --shot --usb: MIDI messages over USB at those times (@PATH: from a file); FM1_USB_TRACE: the bus
      FM1_USB_SIE_NS=N      --usb: each SIE register access takes N ns (default 1000)
+     FM1_AUDIO_FRAME_NS=N  an I2S frame takes N ns (default: the stock 44.1 kHz; 20800 for a firmware at 160 MHz / 13 / 256)
+     FM1_USB_PLAY=FILE     --usb, --bench / --shot: play FILE (s16le stereo, no header) to the device's USB audio
+                           output as a computer would, from FM1_USB_PLAY_AT ms on (default 0)
      FM1_USB_WAV=FILE      --usb, --bench / --shot: record the USB audio as a computer would (s16le, no header);
                            FM1_USB_RATE=HZ asks for that rate if the device lists it (default 44100)";
 
