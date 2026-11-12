@@ -159,6 +159,60 @@ Fm1eStatus statusOf (FM1CeptionProcessor& p, int slot)
     return st;
 }
 
+/** The editor as PNGs for the web page: a different firmware in each engine (`fws` in turn), every one
+    playing a chord: eight tiled, four tiled, four as screens only, the hardware view and the tabbed one. */
+int siteShots (const juce::File& dir, const juce::Array<juce::File>& fws)
+{
+    dir.createDirectory();
+    FM1CeptionProcessor p;
+    p.prepareToPlay (kSr, kBlock);
+    p.setMidiMode (FM1CeptionProcessor::MidiMode::custom);
+    using V = FM1CeptionProcessor;
+
+    auto shoot = [&] (int n, int w, int h, const juce::String& file, V::ViewLayout layout = V::ViewLayout::tiled, int options = 0)
+    {
+        p.setNumEngines (n);
+        p.setViewLayout (layout);
+        for (const auto o : { V::screensOnly, V::editButtons, V::largeKeyboard })
+            p.setViewOption (o, (options & o) != 0);
+        p.setSelected (0);
+        for (int i = 0; i < n; ++i)
+            if (auto e = p.engine (i); e != nullptr && ! e->hasFirmware())
+                p.loadFileNow (i, fws[i % fws.size()]);
+        juce::Thread::sleep (6000);
+
+        juce::AudioBuffer<float> buf (2, kBlock);
+        for (int b = 0; b < 64; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0)
+                for (const int note : { 48, 55, 60, 64, 67 })
+                    midi.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) 110), 0);
+            p.processBlock (buf, midi);
+            juce::Thread::sleep (10);
+        }
+
+        std::unique_ptr<juce::AudioProcessorEditor> ed (p.createEditor());
+        ed->setSize (w, h);
+        for (auto* c : ed->getChildren())
+            if (auto* v = dynamic_cast<fm1c::EngineView*> (c))
+                v->refresh();
+        const auto img = ed->createComponentSnapshot (ed->getLocalBounds(), true, 2.0f);
+        juce::FileOutputStream out (dir.getChildFile (file));
+        out.setPosition (0);
+        out.truncate();
+        juce::PNGImageFormat().writeImageToStream (img, out);
+        std::cout << "  wrote " << dir.getChildFile (file).getFullPathName() << std::endl;
+    };
+
+    shoot (8, 1500, 1040, "eight.png");
+    shoot (4, 960, 1330, "four.png");
+    shoot (4, 1980, 540, "screens-only.png", V::ViewLayout::tiled, V::screensOnly);
+    shoot (4, 1000, 728, "hardware.png", V::ViewLayout::hardware, V::editButtons);
+    shoot (4, 480, 688, "tabbed.png", V::ViewLayout::tabbed);
+    return 0;
+}
+
 /** The editor as PNGs: one engine, then four (one left blank, one with its panel buttons up)
     wide and square. The engines run on in real time with no audio taken, so the screens move. */
 int snapshots (const juce::File& dir, const juce::File& fw)
@@ -549,6 +603,13 @@ int main (int argc, char** argv)
         return libraryShot (juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])),
                             argc > 4 ? juce::String (argv[4]) : juce::String ("tiles"), argc > 5 ? juce::String (argv[5]) : juce::String(),
                             argc > 6 ? juce::String (argv[6]).getIntValue() : 1320, argc > 7 ? juce::String (argv[7]).getIntValue() : 820);
+    if (argc > 3 && juce::String (argv[1]) == "--site-shots")
+    {
+        juce::Array<juce::File> fws;
+        for (int i = 3; i < argc; ++i)
+            fws.add (juce::File (juce::String::fromUTF8 (argv[i])));
+        return siteShots (juce::File (juce::String::fromUTF8 (argv[2])), fws);
+    }
     if (argc > 2 && juce::String (argv[1]) == "--snapshot")
         return snapshots (juce::File (juce::String::fromUTF8 (argv[2])), findFirmware (argc - 2, argv + 2));
 

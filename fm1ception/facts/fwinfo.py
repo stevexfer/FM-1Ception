@@ -69,6 +69,8 @@ PAGE = """<!doctype html>
 body {{ margin: 0; background: var(--room); color: var(--silk); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }}
 header {{ padding: 28px 32px 16px; }}
 h1 {{ margin: 0 0 6px; font-size: 22px; font-weight: 650; letter-spacing: 0.01em; }}
+a.back {{ display: inline-block; margin-bottom: 14px; font-size: 13px; color: var(--dim); border: 0; }}
+a.back:hover {{ color: var(--amber); }}
 .caption {{ margin: 0; color: var(--dim); font-size: 13px; max-width: 900px; }}
 .tools {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 0 32px 16px; }}
 input[type=search] {{ width: 300px; height: 30px; padding: 0 10px; border: 1px solid var(--tray); border-radius: 6px; background: var(--header); color: var(--silk); font: inherit; }}
@@ -94,6 +96,7 @@ footer {{ padding: 0 32px 32px; color: var(--dim); font-size: 12px; }}
 </head>
 <body>
 <header>
+<a class="back" href="/fm1ception/">← FM-1Ception</a>
 <h1>Outside code in FM-1 firmwares</h1>
 <p class="caption">{n} firmwares for the M-VAVE FM-1 whose source holds or ports code from outside projects
 (other FM-1 firmwares and platforms left out). From FM-1Ception's firmware facts: each repository read at its commit of {scanned}.</p>
