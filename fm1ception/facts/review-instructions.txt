@@ -1,0 +1,114 @@
+FIRMWARE FACTS: HAND REVIEW INSTRUCTIONS
+
+What this is for
+----------------
+FM-1Ception is a plugin that runs community firmwares for the M-VAVE FM-1 (a small synth keyboard on a JieLi AC79 /
+WL82 chip). Its library and Cloud browser will show, for each firmware, the facts about its source that won't change:
+what it is built on, where its synth engines and DSP come from, which third-party code it holds, and a few findings.
+Musicians read these, so be accurate, plain and fair. Every fact needs evidence a person can check (file paths, the
+README's or credit's own words). A finding is a finding, never an accusation.
+
+Your inputs (all local; do not use the network, do not build anything, do not modify the clones)
+-----------------------------------------------------------------------------------------------
+  ~/FirmwareFacts/review/batches/NN.txt   your batch: one repository key a line (key = owner__name, lowercase)
+  ~/FirmwareFacts/review/briefs/<key>.txt the automatic scan's findings in a page: start here
+  ~/FirmwareFacts/auto/<key>.json         the full automatic report, if you need more than the brief
+  ~/FirmwareFacts/repos/<key>/            a shallow clone of the repository at the scanned commit, submodules included
+  ~/FirmwareFacts/auto/bases.json         the known bases and how much of each other's code they hold
+
+How to read the brief
+---------------------
+- "nearest bases by code": bases whose distinctive code (code no unrelated base has) the repository holds 30% or more
+  of. "X% of its code is the base's" is the share of the repository's code found in the base; "Y% of the base's
+  distinctive code" is how much of what makes that base itself is in the repository. A high Y means built on it.
+- "reference code it holds": files whose code matches a known DSP project's (exact token fingerprints, comments and
+  formatting ignored). [own] = in the repository's own tree, [submodule ...] = a git submodule, [bundled] = under a
+  third_party/vendor/external folder. A share near 100% is a copy; 25-40% may be partial or coincidental: open both if
+  it matters. Paths like upstream/ or lib/<project>/ are vendored copies too.
+- "names its files mention": regex hits for project names, authors and techniques. They are leads, not facts: a
+  comment saying "unlike Surge" is not Surge code. Many hits in Felucca or Dinghy forks come from the base's own text.
+- AI: tool files at the repository's top level (CLAUDE.md, AGENTS.md, .cursor, ...) and documents' mentions.
+
+The known bases and layers
+--------------------------
+  m-vave/fm1_open           M-VAVE's own open SDK / reference firmware release (hardware layer and a demo synth)
+  charlesvestal/fm1-base    a hardware layer (BSP) many firmwares use as a submodule ("base/")
+  hugelton/felucca-bsp      Felucca's hardware layer; hugelton/Felucca-Engines: Felucca's synth engines
+  hugelton/Felucca          a multi-engine firmware platform (credits msfa, snes_spc, DaisySP, Mutable Rings, Fukiai)
+  zvenson/dinghy, isod89/sloop-fm1 (SLOOP), keremimo/melodee, charlesvestal/fm1-x0x, charlesvestal/fm1-amb,
+  Quixotic7/ChoralRootFM1, illuminus5/skiff, math0ne/fm1-chord, FicusFicusov/CoralFlower, cartesive/fumi-1:
+                            firmwares that others fork or copy
+  joakimeriksson/fm1-emu    an FM-1 emulator (web), joakimeriksson/fm1-sid: a SID firmware built with it
+"base" is the firmware whose application code this one is built from (forked, copied, or as a submodule), or what its
+README says it was derived from, even a base not in this list (e.g. "a fork of FMini-1, itself a fork of Felucca":
+base = FMini-1, and say Felucca in the evidence). A hardware layer alone (fm1-base, felucca-bsp, fm1_open's drivers)
+is "hardware", not "base": such a firmware is "original": true with base null.
+
+For each repository in your batch
+---------------------------------
+1. Read its brief. Then open its README, its credit / licence / notice files, and list its source tree. Find where its
+   sound is made (engines, voices, oscillators, filters, effects) and skim those files' headers and structure.
+2. Check the leads that matter: open matched files and their headers (a kept copyright header IS a credit); confirm
+   ports the README claims (setBfree, Plaits, ...); look for copied code from projects not in the scan's list (look
+   for other authors' copyright lines, SPDX tags, "ported from", "based on", URLs in comments).
+3. Write ~/FirmwareFacts/review/done/<key>.json, valid JSON exactly in this shape:
+
+{
+  "repo": "owner/name",
+  "summary": "One or two plain sentences: what it is and what makes its sound. No hype, no judgement.",
+  "original": true,
+  "base": null,
+  "hardware": "fm1-base",
+  "engines": [
+    {"name": "WAVES", "kind": "wavetable", "origin": "own", "evidence": "firmware/src/eng_waves.c", "confidence": "high"}
+  ],
+  "origins": [
+    {"project": "Mutable Instruments Plaits", "author": "Emilie Gillet", "license": "MIT",
+     "what": "the speech and modal engines", "how": "code",
+     "evidence": "firmware/plaits/upstream/plaits/ (98-100% matches, headers kept)", "confidence": "high"}
+  ],
+  "techniques": ["Zavalishin TPT state-variable filter", "PolyBLEP oscillators"],
+  "assets": "",
+  "findings": [
+    {"kind": "ai", "text": "Its README says it was developed with Claude Code.", "evidence": "README.md, CLAUDE.md",
+     "confidence": "high"}
+  ]
+}
+
+Fields:
+  base        null, or {"repo": "owner/name" (or "" if not on GitHub), "name": "Felucca",
+              "how": "fork" | "copy" | "submodule" | "stated" | "code", "confidence": ..., "evidence": "..."}
+              fork = GitHub fork; copy = its tree holds the base's code; submodule; stated = only its documents say so;
+              code = the fingerprints say so and nothing else does.
+  hardware    "fm1-base" | "felucca-bsp" | "fm1_open" | "own" | "other: <what>"
+  engines     the engines or voices it offers, by the names it uses (up to ~16; group the rest by kind).
+              kind one of: FM, wavetable, virtual analog, samples, granular, physical modelling, additive,
+              formant / speech, chip emulation, drum synthesis, other. origin "own" or the project it comes from.
+  origins     third-party code, ports and credited sources it holds (DSP first; also notable non-DSP: Lua, Doom,
+              fonts are assets). how: code (copied), port (translated or adapted from), credited (its credits say so but
+              you could not see it), technique (only when the README attributes a whole engine to a published design).
+              If it came in through its base, say "via Felucca" (etc.) in "what".
+  techniques  named, published algorithms its own code implements (TPT SVF, Simper/Cytomic SVF, PolyBLEP, Freeverb,
+              Dattorro plate, Karplus-Strong, RBJ biquads, Chamberlin SVF, ...). Only ones you can see.
+  assets      samples, wavetables, fonts it embeds and where they say they come from; "" for none.
+  findings    kind "licence": its licence and its code's disagree (e.g. GPL-3.0 code in an MIT repository), or it holds
+                              material it says it may not redistribute, or it has no licence at all.
+              kind "uncredited": it holds another project's code (a high match, or a recognisable copy) with no
+                              credit, header or notice for it anywhere. Check first; a kept header is a credit.
+              kind "ai": AI tools' traces: their files at its top level, or its documents saying so. Say what was found
+                              ("Its README says it was developed with AI coding agents"; "CLAUDE.md at its top level").
+                              If the only traces are text inherited from its base, say so with "medium".
+              kind "other": anything else a musician or developer would want to know and that won't change (it runs
+                              on both cores, it is a collection of other firmwares, it replaces the boot loader, ...).
+              text: neutral, factual, one or two sentences. confidence: high (seen directly), medium (strong
+              indication), low (a lead only).
+  confidence  "high" | "medium" | "low" everywhere it appears.
+
+Keep it proportionate: a small single-engine firmware needs a few minutes; a big platform deserves more. If a
+repository is empty, broken or not firmware, still write the file: say so in summary, empty lists, and a finding.
+
+When your batch is done
+-----------------------
+Run:  /usr/bin/python3 /Users/steveduda/Documents/GitHub/FM-1Ception/fm1ception/facts/review.py check --batch NN
+and fix whatever it reports. Then reply with one line per repository: key, base (or "original"), and its most notable
+origin or finding; then anything you could not determine.

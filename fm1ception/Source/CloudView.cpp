@@ -1,4 +1,5 @@
 #include "CloudView.h"
+#include "FirmwareFacts.h"
 #include "LibraryWindow.h"
 #include "Theme.h"
 
@@ -47,6 +48,30 @@ juce::String versionText (const Entry& e)
     return e.beta && e.version.isNotEmpty() ? e.version + " beta" : e.version;
 }
 
+const FirmwareFacts::Facts* sourceOf (const Entry& e)
+{
+    return FirmwareFacts::get().of (e.repo);
+}
+
+juce::String builtOnText (const Entry& e)
+{
+    const auto* f = sourceOf (e);
+    const auto s = f != nullptr ? f->builtOn() : juce::String();
+    return s.isNotEmpty() ? s : e.base;
+}
+
+juce::String soundText (const Entry& e)
+{
+    const auto* f = sourceOf (e);
+    return f != nullptr ? f->sound() : juce::String();
+}
+
+juce::String codeFromText (const Entry& e)
+{
+    const auto* f = sourceOf (e);
+    return f != nullptr ? f->codeFrom() : juce::String();
+}
+
 int rank (Status s)
 {
     switch (s)
@@ -73,13 +98,26 @@ CloudView::CloudView (CloudCatalog& c, FirmwareLibrary& lib, LibraryEngines e)
     h.addColumn ("AUTHOR", author, 140, 70, 400, flags);
     h.addColumn ("STATUS", status, 112, 100, 300, flags);
     h.addColumn ("TAGS", tags, 150, 70, 600, flags);
+    h.addColumn ("BUILT ON", builtOn, 140, 70, 600, flags);
+    h.addColumn ("SOUND", sound, 150, 70, 600, flags);
+    h.addColumn ("CODE FROM", codeFrom, 200, 70, 1200, flags);
     h.addColumn ("ABOUT", about, 380, 90, 4000, flags);
     h.addColumn ("LICENSE", license, 130, 70, 600, flags);
     h.addColumn ("PROJECT", project, 210, 90, 2000, flags);
     h.setSortColumnId (name, true);
     h.setStretchToFitActive (false);
     if (const auto saved = library.getCloudColumns(); saved.isNotEmpty())
+    {
         h.restoreFromString (saved);
+        // columns newer than the layout it kept go before ABOUT, not after all of them
+        juce::Array<int> kept;
+        if (const auto xml = juce::parseXMLIfTagMatches (saved, "TABLELAYOUT"))
+            for (const auto* c : xml->getChildIterator())
+                kept.add (c->getIntAttribute ("id"));
+        for (const int c : { (int) builtOn, (int) sound, (int) codeFrom })
+            if (const int at = h.getIndexOfColumnId (about, false); ! kept.contains (c) && at >= 0)
+                h.moveColumn (c, at);
+    }
     sortColumn = h.getSortColumnId() != 0 ? h.getSortColumnId() : (int) name;
     sortForwards = h.isSortedForwards();
 
@@ -145,11 +183,13 @@ void CloudView::refill()
     for (int i = 0; i < (int) entries.size(); ++i)
     {
         const auto& e = entries[(size_t) i];
-        if (std::all_of (words.begin(), words.end(), [&e] (const juce::String& w)
+        const auto* source = sourceOf (e);
+        const auto said = source != nullptr ? source->searchText() : juce::String();
+        if (std::all_of (words.begin(), words.end(), [&e, &said] (const juce::String& w)
             {
                 return e.name.containsIgnoreCase (w) || e.author.containsIgnoreCase (w) || e.about.containsIgnoreCase (w)
                     || e.id.containsIgnoreCase (w) || tagsText (e).containsIgnoreCase (w) || e.base.containsIgnoreCase (w)
-                    || (e.isBase && juce::String ("base").startsWithIgnoreCase (w));
+                    || (e.isBase && juce::String ("base").startsWithIgnoreCase (w)) || said.containsIgnoreCase (w);
             }))
             rows.push_back (i);
     }
@@ -178,6 +218,9 @@ void CloudView::resort()
             case about:   return e.about;
             case license: return e.license;
             case project: return projectText (e.repo);
+            case builtOn: return builtOnText (e);
+            case sound:   return soundText (e);
+            case codeFrom: return codeFromText (e);
             default:      return {};
         }
     };
@@ -252,7 +295,7 @@ void CloudView::updateStatus()
               : error.isNotEmpty() ? "Could not fetch the list of firmwares (" + error + ").  Refresh tries again."
                                    : "Refresh fetches the list of firmwares from mutant.cloud.";
     else if (shown == 0)
-        empty = "No firmware has \"" + searchText.trim() + "\" in its name, author, tags or about.";
+        empty = "No firmware has \"" + searchText.trim() + "\" in its name, author, tags, about or source facts.";
     note.setText (empty, juce::dontSendNotification);
     note.setVisible (empty.isNotEmpty());
     repaint();
@@ -338,6 +381,13 @@ void CloudView::paintCell (juce::Graphics& g, int row, int column, int w, int h,
             g.setColour (theme::dimSilk);
             g.drawText (e.about, r, juce::Justification::centredLeft, true);
             break;
+        case builtOn:
+        case sound:
+        case codeFrom:
+            g.setColour (theme::dimSilk);
+            g.drawText (column == builtOn ? builtOnText (e) : column == sound ? soundText (e) : codeFromText (e),
+                        r, juce::Justification::centredLeft, true);
+            break;
         case status:
         {
             const auto s = cloud.statusOf (e);
@@ -393,6 +443,29 @@ juce::String CloudView::getCellTooltip (int row, int column)
             return e.license;
         case tags:
             return tagsText (e);
+        case builtOn:
+            if (const auto* f = sourceOf (e); f != nullptr && f->base.has_value())
+                return f->base->name + (f->base->repo.isNotEmpty() ? "  (" + f->base->repo + ")" : juce::String()) + "\n" + f->base->evidence;
+            return builtOnText (e);
+        case sound:
+            if (const auto* f = sourceOf (e))
+            {
+                juce::StringArray lines;
+                for (const auto& x : f->engines)
+                    lines.add (x.name + "  " + x.kind + (x.origin.isNotEmpty() && x.origin != "own" ? ", from " + x.origin : juce::String()));
+                return lines.joinIntoString ("\n");
+            }
+            return {};
+        case codeFrom:
+            if (const auto* f = sourceOf (e))
+            {
+                juce::StringArray lines;
+                for (const auto& o : f->origins)
+                    if ((o.how == "code" || o.how == "port") && ! o.fm1)
+                        lines.add (o.project + (o.license.isNotEmpty() ? " (" + o.license + ")" : juce::String()) + ": " + o.what);
+                return lines.joinIntoString ("\n");
+            }
+            return {};
         case project:
             return e.repo;
         case status:

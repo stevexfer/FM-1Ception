@@ -27,7 +27,8 @@ class CloudView : public juce::Component,
                   private juce::ChangeListener
 {
 public:
-    enum Column { name = 1, version, author, status, about, license, project, tags };
+    /** BUILT ON, SOUND and CODE FROM are what its source says (FirmwareFacts), BUILT ON its list's base without. */
+    enum Column { name = 1, version, author, status, about, license, project, tags, builtOn, sound, codeFrom };
 
     CloudView (CloudCatalog&, FirmwareLibrary&, LibraryEngines);
     ~CloudView() override;
@@ -37,7 +38,7 @@ public:
 
     int numRows() const { return (int) rows.size(); }
     const CloudCatalog::Entry& entryAt (int row) const { return entries[(size_t) rows[(size_t) row]]; }
-    /** Over the name, author, about and id. */
+    /** Over the name, author, about, id, tags, base and what its source says. */
     void setSearch (const juce::String&);
     void sortBy (Column, bool forwards);
     void saveColumns();

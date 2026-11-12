@@ -7,7 +7,7 @@ namespace fm1c
 {
 namespace
 {
-constexpr int kPad = 14, kThumb = 40, kThumbGap = 8;
+constexpr int kPad = 14, kThumb = 40, kThumbGap = 8, kSourceH = 30;
 const char* const kPictureNames[] { "0.3 s", "5 s", "Hub card" };
 
 /** Text wrapped to `width`. */
@@ -57,12 +57,65 @@ void drawStars (juce::Graphics& g, juce::Rectangle<float> r, int stars)
         g.fillPath (p);
     }
 }
+
+/** SOURCE FACTS' page: all of a firmware's facts, to scroll through. */
+class FactsView : public juce::Component
+{
+public:
+    explicit FactsView (const FirmwareFacts::Facts& f) : page (f.describe())
+    {
+        viewport.setViewedComponent (&page, false);
+        viewport.setScrollBarsShown (true, false);
+        viewport.setScrollBarThickness (9);
+        addAndMakeVisible (viewport);
+        page.layoutFor (kWidth - viewport.getScrollBarThickness());
+        setSize (kWidth, juce::jmin (kMaxHeight, page.getHeight()));
+    }
+
+    void paint (juce::Graphics& g) override { g.fillAll (theme::header); }
+
+    void resized() override
+    {
+        viewport.setBounds (getLocalBounds());
+        page.layoutFor (getWidth() - viewport.getScrollBarThickness());
+    }
+
+private:
+    static constexpr int kWidth = 470, kMaxHeight = 600;
+
+    struct Page : juce::Component
+    {
+        explicit Page (juce::AttributedString s) : text (std::move (s)) {}
+
+        void layoutFor (int width)
+        {
+            layout.createLayout (text, (float) (width - 2 * kPad));
+            setSize (width, (int) std::ceil (layout.getHeight()) + 2 * kPad);
+        }
+
+        void paint (juce::Graphics& g) override { layout.draw (g, getLocalBounds().reduced (kPad).toFloat()); }
+
+        static constexpr int kPad = 16;
+        juce::AttributedString text;
+        juce::TextLayout layout;
+    };
+
+    Page page;
+    juce::Viewport viewport;
+};
 } // namespace
 
 InfoPanel::InfoPanel (ScreenCache* c) : cache (c)
 {
     action.onClick = [this] { captureNow (shots.error.isNotEmpty()); };
     addChildComponent (action);
+    sourceButton.setTooltip ("What its source says: what it is built on, where its sound comes from, the outside code it holds");
+    sourceButton.onClick = [this]
+    {
+        if (info.source != nullptr)
+            juce::CallOutBox::launchAsynchronously (std::make_unique<FactsView> (*info.source), sourceButton.getScreenBounds(), nullptr);
+    };
+    addChildComponent (sourceButton);
     if (cache != nullptr)
         cache->addChangeListener (this);
 }
@@ -85,6 +138,7 @@ void InfoPanel::show (Info next)
         if (info.package.existsAsFile() && info.shotsKey.isNotEmpty())
             startTimer (kDwellMs);
     }
+    sourceButton.setVisible (info.key.isNotEmpty() && info.source != nullptr);
     refreshPictures();
 }
 
@@ -159,6 +213,7 @@ void InfoPanel::resized()
 void InfoPanel::layout()
 {
     auto b = getLocalBounds().reduced (kPad);
+    sourceButton.setBounds (b.withTop (b.getBottom() - kSourceH + 4).withWidth (120));
     const int side = juce::jmin (b.getWidth(), juce::jmax (120, (int) ((float) getHeight() * 0.46f)));
     big = b.removeFromTop (side).withSizeKeepingCentre (side, side);
     action.setBounds (big.withSizeKeepingCentre (juce::jmin (150, side - 20), 26).translated (0, 30));
@@ -246,7 +301,8 @@ void InfoPanel::paint (juce::Graphics& g)
     }
 
     // what it is
-    auto area = getLocalBounds().reduced (kPad).withTop (big.getBottom() + 8 + kThumb + 14 + 6).toFloat();
+    auto area = getLocalBounds().reduced (kPad).withTop (big.getBottom() + 8 + kThumb + 14 + 6)
+                    .withTrimmedBottom (sourceButton.isVisible() ? kSourceH : 0).toFloat();
     if (std::all_of (std::begin (thumbs), std::end (thumbs), [] (const auto& t) { return t.isEmpty(); }))
         area.setTop ((float) big.getBottom() + 12.0f);
     const float w = area.getWidth();

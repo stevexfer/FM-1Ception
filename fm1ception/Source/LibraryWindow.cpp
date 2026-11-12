@@ -1103,7 +1103,8 @@ bool LibraryView::isBase (const Item& it)
     return it.listing.isBase && it.listing.exact();
 }
 
-void LibraryView::addListed (InfoPanel::Info& i, const juce::StringArray& tags, const juce::String& base)
+void LibraryView::addListed (InfoPanel::Info& i, const juce::StringArray& tags, const juce::String& base,
+                             const FirmwareFacts::Facts* source)
 {
     juce::StringArray names;
     for (const auto& t : tags)
@@ -1113,8 +1114,17 @@ void LibraryView::addListed (InfoPanel::Info& i, const juce::StringArray& tags, 
     }
     if (! names.isEmpty())
         i.facts.push_back ({ "Tags", names.joinIntoString (", ") });
-    if (base.isNotEmpty())
-        i.facts.push_back ({ "Built on", base });
+    const auto builtOn = source != nullptr ? source->builtOn() : juce::String();
+    if (builtOn.isNotEmpty() || base.isNotEmpty())
+        i.facts.push_back ({ "Built on", builtOn.isNotEmpty() ? builtOn : base });
+    if (source == nullptr)
+        return;
+    i.source = source;
+    for (const auto& [label, value] : { std::pair<const char*, juce::String> { "Sound", source->sound() },
+                                        { "Code from", source->codeFrom() },
+                                        { "Findings", source->findingKinds() } })
+        if (value.isNotEmpty())
+            i.facts.push_back ({ label, value });
 }
 
 InfoPanel::Info LibraryView::infoOf (const Item& it) const
@@ -1129,7 +1139,8 @@ InfoPanel::Info LibraryView::infoOf (const Item& it) const
                + (it.subcategory.isNotEmpty() ? juce::String (juce::CharPointer_UTF8 (" \xc2\xb7 ")) + it.subcategory : juce::String());
     i.rating = it.rating;
     i.note = it.isPackage ? howListed (it) : juce::String ("Not an FM-1 update package");
-    addListed (i, it.listing.tags, it.listing.base);
+    addListed (i, it.listing.tags, it.listing.base,
+               FirmwareFacts::get().of (it.listing.repo.isNotEmpty() ? it.listing.repo : it.url));
     i.facts.push_back ({ "File", it.file.getFileName() });
     i.facts.push_back ({ "Folder", shortPath (it.file.getParentDirectory()) });
     i.facts.push_back ({ "Added", formatDay (it.added) });
@@ -1172,7 +1183,7 @@ InfoPanel::Info LibraryView::infoOf (const CloudCatalog::Entry& e) const
     i.facts.push_back ({ "Status", CloudView::statusText (st) });
     if (file != juce::File())
         i.facts.push_back ({ "In library", file.getFileName() });
-    addListed (i, e.tags, e.base);
+    addListed (i, e.tags, e.base, FirmwareFacts::get().of (e.repo));
     if (e.date.isNotEmpty())
         i.facts.push_back ({ "Released", e.date });
     if (e.archived)

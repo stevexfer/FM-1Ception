@@ -168,6 +168,8 @@ set(FM1C_SOURCES
     Source/FirmwareLibrary.cpp
     Source/CategoryPresets.h
     Source/CategoryPresets.cpp
+    Source/FirmwareFacts.h
+    Source/FirmwareFacts.cpp
     Source/InfoPanel.h
     Source/InfoPanel.cpp
     Source/ScreenCache.h
@@ -179,6 +181,13 @@ set(FM1C_SOURCES
     Source/Theme.h
 )
 source_group("Plugin" FILES ${FM1C_SOURCES})
+
+# The firmware facts (fm1ception/facts/assemble.py writes them), built in
+juce_add_binary_data(FM1CeptionData
+    HEADER_NAME FM1CeptionData.h
+    NAMESPACE   FM1CeptionData
+    SOURCES     Resources/FirmwareFacts.json)
+set_target_properties(FM1CeptionData PROPERTIES FOLDER "Plugin")
 
 if(APPLE)
     set(PLUGIN_FORMATS AU VST3 Standalone)
@@ -241,6 +250,7 @@ target_compile_definitions(FM1Ception PUBLIC ${FM1C_DEFINITIONS} JUCE_VST3_CAN_R
 
 target_link_libraries(FM1Ception PRIVATE
     fm1ception_engine
+    FM1CeptionData
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
@@ -273,6 +283,7 @@ if(FM1C_BUILD_TESTS)
         Source/CloudView.cpp
         Source/FirmwareLibrary.cpp
         Source/CategoryPresets.cpp
+        Source/FirmwareFacts.cpp
         Source/InfoPanel.cpp
         Source/ScreenCache.cpp
         Source/LibraryWindow.cpp
@@ -289,6 +300,7 @@ if(FM1C_BUILD_TESTS)
     )
     target_link_libraries(FM1CeptionTests PRIVATE
         fm1ception_engine
+        FM1CeptionData
         juce::juce_audio_utils
         juce::juce_recommended_config_flags
     )

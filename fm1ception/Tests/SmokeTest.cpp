@@ -456,6 +456,32 @@ int cloudStatus (const juce::File& support, const juce::StringArray& filter)
 int libraryShot (const juce::File& support, const juce::File& png, const juce::String& view, const juce::String& category,
                  int width, int height)
 {
+    auto write = [&png] (const juce::Image& img)
+    {
+        png.deleteFile();
+        juce::FileOutputStream out (png);
+        juce::PNGImageFormat().writeImageToStream (img, out);
+    };
+    if (view == "facts")
+    {
+        // SOURCE FACTS' page for one repository (`category`: "owner/name")
+        const auto* f = FirmwareFacts::get().of (category);
+        if (f == nullptr)
+        {
+            std::cout << "no facts for " << category << std::endl;
+            return 1;
+        }
+        juce::TextLayout layout;
+        layout.createLayout (f->describe(), (float) width - 32.0f);
+        juce::Image img (juce::Image::ARGB, width * 2, ((int) std::ceil (layout.getHeight()) + 32) * 2, true);
+        juce::Graphics g (img);
+        g.addTransform (juce::AffineTransform::scale (2.0f));
+        g.fillAll (juce::Colour (0xff111214));
+        layout.draw (g, juce::Rectangle<float> (16.0f, 16.0f, (float) width - 32.0f, layout.getHeight()));
+        write (img);
+        std::cout << "wrote " << png.getFullPathName() << std::endl;
+        return 0;
+    }
     const auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("fm1c-library-view");
     tmp.deleteRecursively();
     tmp.createDirectory();
@@ -477,15 +503,28 @@ int libraryShot (const juce::File& support, const juce::File& png, const juce::S
         engines.load = [] (int, const juce::File&) {};
         LibraryView v (lib, engines, &cloud, &screens);
         v.setSize (width, height);
-        v.showTiles (view == "tiles");
-        if (category.isNotEmpty())
-            v.setFilters ({ FirmwareLibrary::categoryFromName (category) }, false, false);
-        v.sortBy (LibraryView::dateAdded, false);
-        const auto img = v.createComponentSnapshot (v.getLocalBounds(), true, 2.0f);
-        png.deleteFile();
-        juce::FileOutputStream out (png);
-        juce::PNGImageFormat().writeImageToStream (img, out);
-        std::cout << "wrote " << png.getFullPathName() << " (" << v.numRows() << " shown)" << std::endl;
+        if (view == "cloud")
+        {
+            // the Cloud, searched for `category`, its first row in the info panel
+            v.showCloud (true);
+            v.showInfo (true);
+            if (auto* c = v.cloudView())
+            {
+                c->setSearch (category);
+                if (c->numRows() > 0)
+                    v.infoPanel().show (v.infoOf (c->entryAt (0)));
+            }
+        }
+        else
+        {
+            v.showTiles (view == "tiles");
+            if (category.isNotEmpty())
+                v.setFilters ({ FirmwareLibrary::categoryFromName (category) }, false, false);
+            v.sortBy (LibraryView::dateAdded, false);
+        }
+        write (v.createComponentSnapshot (v.getLocalBounds(), true, 2.0f));
+        std::cout << "wrote " << png.getFullPathName() << " (" << (view == "cloud" && v.cloudView() != nullptr ? v.cloudView()->numRows() : v.numRows())
+                  << " shown)" << std::endl;
     }
     tmp.deleteRecursively();
     return 0;
@@ -1016,6 +1055,75 @@ int main (int argc, char** argv)
             check (after == before + 1, "a launch from outside the folder counts for the firmware with its bytes, and is kept");
         }
         tmp.deleteRecursively();
+    }
+
+    std::cout << "\n=== the firmware facts ===" << std::endl;
+    {
+        check (FirmwareFacts::keyOf ("https://github.com/Hugelton/Felucca") == "hugelton/felucca"
+                   && FirmwareFacts::keyOf ("github.com/hugelton/Felucca.git") == "hugelton/felucca"
+                   && FirmwareFacts::keyOf ("https://github.com/a/b/releases/download/v1/x.fwsc") == "a/b"
+                   && FirmwareFacts::keyOf ("Owner/Name") == "owner/name"
+                   && FirmwareFacts::keyOf ("https://example.com/a/b").isEmpty() && FirmwareFacts::keyOf ("felucca").isEmpty(),
+               "a repository is known by its GitHub path, however its URL says it");
+
+        const FirmwareFacts sample (R"json({"version":1,"scanned":"2026-11-12","firmwares":{
+          "a/fork":{"repo":"A/Fork","commit":"0123456789ab","reviewed":true,"summary":"Two engines.","original":false,
+            "base":{"repo":"hugelton/Felucca","name":"Felucca","how":"fork","confidence":"high","evidence":"a GitHub fork"},
+            "hardware":"felucca-bsp",
+            "engines":[{"name":"WAVES","kind":"wavetable","origin":"own"},{"name":"DX","kind":"FM","origin":"msfa"},
+                       {"name":"OPS","kind":"FM","origin":"own"}],
+            "origins":[{"project":"Mutable Instruments Plaits (eurorack)","license":"MIT","what":"speech","how":"code","confidence":"high"},
+                       {"project":"Felucca","what":"its platform","how":"code","confidence":"high","fm1":true},
+                       {"project":"Elektron Digitone","how":"technique","confidence":"high"}],
+            "techniques":["PolyBLEP oscillators"],
+            "findings":[{"kind":"ai","text":"CLAUDE.md at its top level.","confidence":"high"},
+                        {"kind":"licence","text":"No licence.","confidence":"high"}],
+            "license":"GPL-3.0","midi":["CC"],"languages":{"C":1200,"assembly":10}},
+          "b/own":{"repo":"B/Own","original":true,"base":null,"engines":[]},
+          "c/on-dinghy":{"repo":"C/On-Dinghy","original":true,"base":{"repo":"zvenson/dinghy","name":"Dinghy","how":"template"}}}})json");
+        const auto* fork = sample.of ("https://github.com/a/fork");
+        const auto* own = sample.of ("b/own");
+        const auto* onTemplate = sample.of ("c/on-dinghy");
+        check (sample.size() == 3 && sample.scanned() == "2026-11-12" && fork != nullptr && own != nullptr
+                   && sample.of ("https://github.com/c/none") == nullptr,
+               "facts read, each found by its repository");
+        check (onTemplate != nullptr && onTemplate->builtOn() == "Dinghy (template)", "one on a starter template says so");
+        check (fork != nullptr && fork->reviewed && fork->base.has_value() && fork->base->name == "Felucca"
+                   && fork->builtOn() == "Felucca (a fork)" && fork->sound() == "FM, wavetable"
+                   && fork->codeFrom() == "Mutable Instruments Plaits" && fork->findingKinds() == "AI tools, licence"
+                   && fork->languages.size() == 2 && fork->languages[0].first == "C",
+               "a firmware's facts: its base, its sound by its engines' kinds, the outside code it holds (not other FM-1 firmwares'), its findings");
+        check (own != nullptr && own->builtOn() == "Its own code" && own->sound().isEmpty() && own->codeFrom().isEmpty(),
+               "one of its own code");
+        check (fork != nullptr && fork->searchText().contains ("Plaits") && fork->searchText().contains ("WAVES")
+                   && fork->describe().getText().contains ("CLAUDE.md at its top level")
+                   && fork->describe().getText().contains ("OUTSIDE CODE"),
+               "they can be searched, and read in full");
+
+        InfoPanel::Info listed;
+        LibraryView::addListed (listed, { "synth" }, "Felucca", fork);
+        auto row = [&listed] (const juce::String& label)
+        {
+            for (const auto& [l, v] : listed.facts)
+                if (l == label)
+                    return v;
+            return juce::String();
+        };
+        check (listed.source == fork && row ("Built on") == "Felucca (a fork)" && row ("Sound") == "FM, wavetable"
+                   && row ("Code from") == "Mutable Instruments Plaits" && row ("Findings") == "AI tools, licence",
+               "the info panel shows them, with SOURCE FACTS for all of it");
+        InfoPanel::Info unknown;
+        LibraryView::addListed (unknown, {}, "SLOOP", nullptr);
+        check (unknown.source == nullptr && unknown.facts.size() == 1 && unknown.facts[0].second == "SLOOP",
+               "one not known shows its list's base");
+
+        const auto& built = FirmwareFacts::get();
+        const auto* felucca = built.of ("https://github.com/hugelton/Felucca");
+        const auto* aFork = built.of ("https://github.com/vrcvs/Felucca");
+        check (built.size() >= 400 && built.scanned().isNotEmpty(), "the built-in facts: " + juce::String (built.size()) + " firmwares");
+        check (felucca != nullptr && felucca->reviewed && felucca->summary.isNotEmpty() && ! felucca->engines.empty(),
+               "Felucca's, read by hand");
+        check (aFork != nullptr && aFork->builtOn() == "Felucca (a fork)", "a fork of it is built on it");
     }
 
     std::cout << "\n=== the Cloud ===" << std::endl;

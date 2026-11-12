@@ -89,7 +89,9 @@ public:
     InfoPanel::Info infoOf (const FirmwareLibrary::Item&) const;
     /** Others are built on it, as the lists know it by its bytes. */
     static bool isBase (const FirmwareLibrary::Item&);
-    static void addListed (InfoPanel::Info&, const juce::StringArray& tags, const juce::String& base);
+    /** Its tags and base as its list says, then what its source says (`source`, null for not known). */
+    static void addListed (InfoPanel::Info&, const juce::StringArray& tags, const juce::String& base,
+                           const FirmwareFacts::Facts* source);
     InfoPanel::Info infoOf (const CloudCatalog::Entry&) const;
     /** The panel brought up to the row under the mouse (else the one selected): its timer's. */
     void updateInfo();

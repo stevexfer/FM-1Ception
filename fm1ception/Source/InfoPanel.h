@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "FirmwareFacts.h"
 #include "ScreenCache.h"
 
 namespace fm1c
@@ -9,7 +10,8 @@ namespace fm1c
 // The library window's side panel: one firmware (the row under the mouse, else
 // the selected one) with its screens, large, and small ones to pick from (a
 // moment after it boots, once it has settled, the Hub's card if it has one),
-// then what it is, who made it and the rest. A firmware with a package to hand
+// then what it is, who made it and the rest, and SOURCE FACTS for what its
+// source says (FirmwareFacts) when that is known. A firmware with a package to hand
 // has its screens captured once it has been shown a moment (ScreenCache); one of
 // the Cloud's not downloaded yet has PREVIEW SCREENS to fetch it for that.
 //==============================================================================
@@ -39,6 +41,8 @@ public:
         ScreenCache::Fetch fetch;
         /** The Hub's artwork for it. */
         juce::String card;
+        /** What its source says (FirmwareFacts'), for SOURCE FACTS; null for none. */
+        const FirmwareFacts::Facts* source = nullptr;
     };
 
     explicit InfoPanel (ScreenCache*);
@@ -74,7 +78,7 @@ private:
     juce::Rectangle<int> big, linkArea;
     juce::Rectangle<int> thumbs[3];
     bool overLink = false;
-    juce::TextButton action;
+    juce::TextButton action, sourceButton { "SOURCE FACTS" };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (InfoPanel)
 };
