@@ -1454,6 +1454,19 @@ int main (int argc, char** argv)
                    "a firmware put in the folder some other way, byte for byte the list's, is In Library: no second copy to GET");
         }
 
+        // The real lists, over HTTPS: only when asked, as it needs the network. On Linux this is
+        // what tells whether JUCE was built with curl (without it, URL has no TLS).
+        if (juce::SystemStats::getEnvironmentVariable ("FM1C_TEST_NETWORK", {}).isNotEmpty())
+        {
+            CloudCatalog live (lib, tmp.getChildFile ("live.json"),
+                               { juce::URL (CloudCatalog::kListUrl), juce::URL (CloudCatalog::kFillListUrl) },
+                               juce::URL (CloudCatalog::kHubCatalogUrl));
+            live.refresh();
+            live.waitForIdle (60000);
+            check (live.entries().size() > 10 && live.getFetchError().isEmpty(),
+                   "the real lists come over HTTPS (" + juce::String ((int) live.entries().size()) + " entries) " + live.getFetchError());
+        }
+
         check (CloudCatalog::resolve (juce::URL ("https://thefirmwarehub.com/catalog.json"), "fw/a-1.fwsc") == "https://thefirmwarehub.com/fw/a-1.fwsc"
                    && CloudCatalog::resolve (juce::URL ("https://x.io/app/install/"), "./b.fwsc") == "https://x.io/app/install/b.fwsc"
                    && CloudCatalog::resolve (juce::URL ("https://x.io/app/index.html"), "/fw/c.fwsc") == "https://x.io/fw/c.fwsc"
@@ -1761,9 +1774,15 @@ int main (int argc, char** argv)
                     break;
                 }
             check (row >= 0, "the table lists the copied firmware");
-            const auto info = view.infoOf (view.itemAt (row));
-            check (info.title == rowItem->name() && info.version == rowItem->version() && info.shotsKey == digest
-                       && info.package.existsAsFile()
+            const auto& item = view.itemAt (row);
+            const auto info = view.infoOf (item);
+            // omni-0.4 (findFirmware's first choice) is known to be SHRUB 0.4 from its package;
+            // another firmware is whatever the library makes of it.
+            const bool omni = real.getFileName() == "omni-0.4.fwsc";
+            const auto title = omni ? juce::String ("SHRUB") : item.name();
+            const auto version = omni ? juce::String ("0.4") : item.version();
+            check (info.title.upToFirstOccurrenceOf (FirmwareLibrary::kBaseMark, false, false) == title
+                       && info.version == version && info.shotsKey == digest && info.package.existsAsFile()
                        && std::any_of (info.facts.begin(), info.facts.end(), [] (const auto& f) { return f.first == "Added" && f.second.length() == 10; }),
                    "with what the firmware is, its dates days, its screens by its digest");
             view.setSize (700, 600);
