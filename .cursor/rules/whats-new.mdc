@@ -19,4 +19,9 @@ alwaysApply: true
   2. Commit only those files (that repository often has unrelated work in progress).
   3. Deploy with `SHRUB_FIRMWARE=keep sh tools/deploy_editor.sh`, which publishes the site without touching
      Shrub's firmware, and check `https://shrub.audio/fm1ception/history` afterwards.
+  4. The script publishes the whole site from the checkout. When FM1ShrubOS has Shrub work that isn't live (its
+     `version.h` ahead of `https://shrub.audio/editor/build.json`, or editor commits after that commit), deploy
+     from a worktree at the live commit with only the FM-1Ception commit added: the live `SHRUB.fwsc` as its
+     `build/SHRUB.fwsc`, a link to the main checkout's `.venv`, and the built `shrub.wasm` the same as the live
+     one. Keep the deployed commit on a branch (`site-deploy-YYYY-MM-DD`).
 - The page names neither Shrub nor Hotwire.
