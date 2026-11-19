@@ -12,8 +12,8 @@ on the page, so an SMK-37 package gets the SMK-37's.
 
 One plugin is written in Rust as a CLAP with [nih-plug](https://github.com/robbert-vdh/nih-plug),
 built without its VST3 bindings (they are GPL). [clap-wrapper](https://github.com/free-audio/clap-wrapper)
-makes the AU and the VST3 of it, each carrying the CLAP in its bundle. Every part is
-permissively licensed:
+makes the AU and the VST3 of it, each carrying the CLAP in its bundle on macOS; on Windows the
+VST3 loads the CLAP from the CLAP folder beside it. Every part is permissively licensed:
 
 | Part | Licence |
 |---|---|
@@ -53,6 +53,48 @@ open vst3sdk-build/bin/Release/editorhost.app --args ~/Library/Audio/Plug-Ins/VS
 An ad hoc signature is enough on the Mac that built the plugin. To give it to others, it has to be
 signed with an Apple Developer ID and notarized.
 
+## Build and install (Windows, x86-64)
+
+```powershell
+tools\build_plugin.ps1
+```
+
+You need Rust (the MSVC toolchain), Visual Studio Build Tools with the C++ workload, CMake and
+git. With winget:
+
+```powershell
+winget install Rustlang.Rustup Kitware.CMake Git.Git
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+The script builds the CLAP (the cdylib, `fm1_plugin.dll`, is `FM-1.clap`), then the VST3 around
+it with clap-wrapper (CMake picks the newest Visual Studio it finds, the Build Tools included, so
+no vcvars is needed; the SDKs are downloaded on the first run). It installs both in the per-user plugin folders, no administrator
+needed: `%LOCALAPPDATA%\Programs\Common\VST3\FM-1.vst3` and `…\Common\CLAP\FM-1.clap`. Set
+`$env:NO_INSTALL = 1` to only build them, into `target\plugin\`.
+
+Unlike the macOS bundles, the Windows VST3 doesn't carry the CLAP: when a host loads it, it
+loads `FM-1.clap` from a CLAP folder (`C:\Program Files\Common Files\CLAP`,
+`%LOCALAPPDATA%\Programs\Common\CLAP`, or a folder in `CLAP_PATH`). So the two files go
+together, and a VST3 host needs the CLAP installed even if it doesn't host CLAPs itself. A DAW
+that doesn't scan the per-user VST3 folder gets `FM-1.vst3` in
+`C:\Program Files\Common Files\VST3` instead (and `FM-1.clap` in `…\Common Files\CLAP`), or its
+settings get the per-user folder added to the plugin paths.
+
+**Steinberg's validator** is built from the SDK that clap-wrapper downloaded, and `CLAP_PATH`
+lets it find the CLAP that was built but not installed:
+
+```powershell
+cmake -S target\plugin\build\cpm\vst3sdk -B target\plugin\vst3sdk-build -A x64 `
+  -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=ON
+cmake --build target\plugin\vst3sdk-build --config Release --target validator
+$env:CLAP_PATH = "$PWD\target\plugin"
+target\plugin\vst3sdk-build\bin\Release\validator.exe target\plugin\FM-1.vst3   # 47 tests pass
+```
+
+The build is not code-signed; Windows hosts load unsigned plugins. REAPER and Waveform scan the
+per-user folders by default, so the plugin shows up after their next plugin scan.
+
 ## Releases
 
 The plugin is released with the rest of the emulator (`.github/workflows/release.yml`, on a tag
@@ -64,7 +106,11 @@ workflow:
 3. builds Steinberg's validator and runs it on the VST3;
 4. packages the zip (`tools/package_plugin.sh`: the three plugins and an `INSTALL.txt`).
 
-Without signing secrets the release is unsigned (`INSTALL.txt` gives the command that lets macOS
+On a Windows runner it runs the tests, builds the CLAP and the VST3 (`tools\build_plugin.ps1`),
+runs Steinberg's validator and packages `fm1-plugin-<version>-windows-x86_64.zip`
+(`tools\package_plugin.ps1`: the two plugins and an `INSTALL.txt`), unsigned.
+
+Without signing secrets the macOS release is unsigned (`INSTALL.txt` gives the command that lets macOS
 open it). With these repository secrets it's signed with a Developer ID and notarized:
 - `MACOS_CERTIFICATE`: a "Developer ID Application" certificate as a base64 `.p12`;
 - `MACOS_CERTIFICATE_PASSWORD`: its password;
@@ -81,6 +127,9 @@ Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` t
   including when the same firmware is already running. For a browser backup that omits
   bring-your-own firmware, load the matching `.fwsc` first, then import the `.fm1save`.
   Invalid imports leave the current setup intact.
+  On a Mac, keep the files outside Desktop, Documents, Downloads and iCloud Drive: macOS keeps a
+  DAW's plugin host out of those folders without asking, and the load fails with "Operation not
+  permitted". `~/Music` or any other folder in your home works.
 - **Export save…** captures the running firmware and its latest flash changes as a `.fm1save`.
   Send it to someone else, import it in the browser, or open it in another VST3/AU/CLAP instance.
   It waits for flash writes to finish and writes the file in the background. Edits held only in
@@ -102,19 +151,40 @@ Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` t
   - a key or button is held while pressed, and a drag across the keys plays a glissando;
   - a knob turns when you drag it up or down, or scroll over it;
   - on the SMK-37 the pads, faders and wheels work too.
+- **Record** writes the FM-1's output to a WAV (44.1 kHz, 16-bit) in your Music folder's
+  `fm1-emu`, until you press Stop.
 - **The status bar** shows the emulation's speed against real time, and counts the frames that
   came late when the computer couldn't keep up.
+- **Lead** is how far ahead of the host the firmware runs beyond one host block, 23, 12 or
+  6 ms. See "Latency" below.
 
 ## How it runs
 
 The firmware makes its audio in DMA halves, and how long a half takes to emulate varies. So the
 machine runs on a thread of its own, a little ahead of the host:
-- **Frames:** it keeps a ring of its 44.1 kHz frames about one host block plus 1024 frames ahead
-  of what the host has taken.
+- **Frames:** it keeps a ring of its 44.1 kHz frames one host block plus the lead (1024, 512
+  or 256 frames) ahead of what the host has taken.
 - **MIDI timing:** host MIDI arrives stamped with the frame it belongs to, and the machine takes
   it when it reaches that frame. A note sounds where the host placed it, and the delay is a
   constant the plugin reports to the host as its latency, so the host compensates for it.
 - **Sample rate:** the output is resampled to the host's rate.
+
+**Latency.** The host makes up the reported latency for notes it places itself: a sequenced
+note lands where it was put. A note played live hears all of it, plus the host's own buffers,
+plus the time the firmware itself takes. At a 512-frame host buffer and the 23 ms lead that is
+about 35 ms (lead and block) + 12 ms (the host's output block) + the firmware's own, 50 ms or
+more. Three things bring it down:
+- the host's buffer size: 128 frames takes the host's share from 24 ms to 6 ms;
+- the lead: 6 ms instead of 23 takes off 17 ms, when the emulation keeps up; "frames late" in
+  the status bar says when it does not, and the lead goes back up. The machine takes a new
+  lead at once; the host is told the new latency through a restart request, which the AU
+  wrapper does not act on, so an AU host (Logic, GarageBand) keeps compensating by the old
+  figure for sequenced notes until the plugin is loaded again. VST3 and CLAP hosts take it
+  at once;
+- the firmware: its own key scan and DMA half buffer, as on the device. Measured in the
+  emulator at 240 MHz, a note to its first sample: Felucca 6–8 ms, Melodee 7 ms, Golana and
+  Caravel 4–5 ms, FOMAJAM 38 ms, CS-1 and 386DX 45–60 ms (their own attack included).
+With a 128-frame buffer and the 6 ms lead a Felucca note sounds about 20 ms after the key.
 
 **A host that takes no audio:** some hosts show the window without processing audio, such as
 Steinberg's test host, or a track that isn't playing. If the host hasn't taken any frames for
@@ -140,7 +210,9 @@ audio. It uses `reference/firmwares/felucca.fwsc` (`node tools/fetch_firmwares.m
 | GarageBand | AU: loads a firmware and runs; the window's redraw on reopening is fixed but not yet seen there |
 | Steinberg's editorhost | VST3: the window draws, firmwares boot and react to the panel |
 | Logic, Ableton, REAPER, Bitwig | not yet tried |
-| Windows, Linux | not built yet: nih-plug and clap-wrapper support them, but `tools/build_plugin.sh` is macOS-only |
+| Windows (x86-64) | builds with `tools\build_plugin.ps1`; the crate's 12 tests and Steinberg's validator (47 of 47) pass on Windows 11 |
+| REAPER 7.84, Waveform Free 14 (Windows 11) | VST3: both find it in the per-user folder, load Felucca through the file dialog and play it from the panel and MIDI (3.4x real time on this PC) |
+| Linux | not built yet: nih-plug and clap-wrapper support it, but the build scripts are macOS and Windows only |
 
 ## Testing portable saves locally
 

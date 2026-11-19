@@ -85,6 +85,10 @@ pub trait Bus {
     fn hw_lock(&mut self, _core: u32, _set: bool) -> bool {
         true
     }
+    /// `testset` on `core` found the byte at `addr` taken and spins on it (the SDK's byte
+    /// locks: `testset b[r]; ifeq goto` back to it). A dual-core bus may hand the machine to
+    /// the other core, the one that holds it.
+    fn spin(&mut self, _core: u32, _addr: u32) {}
     /// Would the next tick be due?
     fn next_tick_due(&self) -> bool {
         true
@@ -104,6 +108,10 @@ pub trait Bus {
     }
     /// RAM bytes lo..hi hold code a block was built from: count writes to them from now on.
     fn code_mark(&mut self, _lo: u32, _hi: u32) {}
+    /// The instruction at pc is fetched (`Cpu::cost_model` only): a bus with a flash cache model
+    /// charges a miss (fm1_soc's `XipCache`)
+    #[inline(always)]
+    fn fetch_cost(&mut self, _pc: u32) {}
 }
 
 /// The RAM from `pc` to its end, when the bus can show it (its JIT memory map), and pc is in it.
@@ -263,6 +271,11 @@ pub struct Cpu {
     pub jit_entries: u64,
     pub jit_insns: u64,
     pub jit_helpers: std::collections::BTreeMap<String, u64>,
+    /// The wasm JIT's exits by reason (`jit_wasm::EXIT_NAMES`), the instructions the calls so
+    /// ended ran, and its loads and stores by path (RAM, XIP, bus; RAM store, code word, bus)
+    pub exit_hist: [u64; 10],
+    pub exit_insns: [u64; 10],
+    pub mem_hist: [u64; 6],
     /// Instruction-cache misses (decodes) since reset.
     pub decodes: u64,
     /// Canonical syntax of the instruction executing (from its cache line).
@@ -300,9 +313,29 @@ pub struct Cpu {
     /// instructions are left, so a stretch knows where that block's call ends. (u32: compiled
     /// code stores it.)
     pub stop_rest: u32,
+    /// The runner's probe (`run_cpu1`): the registers and sp where its stretch began. Compiled
+    /// code for core 1 (wasm) makes the runner's polling test itself when it comes back to the
+    /// stop pc, and runs on when something changed.
+    pub probe: [u32; 17],
     /// Compile the checks for `stop_pc` / `stop_io` into this core's blocks (set before its
     /// JIT is made; core 1's).
     pub stop_checks: bool,
+    /// The PC limits (fm1_soc's CPU guards, `Soc::pc_windows`): code runs inside either window;
+    /// a block entered outside both ends `run_fast` with `pc_trip` set (the runner raises the
+    /// exception after its first instruction, as the FM-1 does), and code out there is never
+    /// compiled. None: no limits.
+    pub pc_win: Option<[(u32, u32); 2]>,
+    /// `run_fast` stopped at a block outside the PC limits (the runner takes it)
+    pub pc_trip: bool,
+    /// the block running is outside the PC limits (tripped already)
+    pc_out: bool,
+    /// The FM-1's cycle costs (`op_cost8`) on top of the one tick an instruction takes, for a
+    /// clock in eighths of a cycle (fm1-live's FM1_STRICT: the interpreter only; compiled code
+    /// still counts one tick an instruction)
+    pub cost_model: bool,
+    /// Executed instructions by ISA form (`IsaEntry::syntax`), counted by `step` (fm1-live's
+    /// FM1_ISA_HIST, with FM1_NO_BLOCKS: what a firmware runs, not only what its image holds)
+    pub isa_hist: Option<Box<std::collections::HashMap<&'static str, u64>>>,
 }
 
 /// What instructions can see of a core between instructions, outside any pair, predicated
@@ -448,6 +481,26 @@ impl PlainState {
     }
 }
 
+/// The decoded-instruction cache (`Cpu::fetch_at`) and the block map (`Cpu::block_at`) are
+/// direct-mapped on the halfword index: 256K lines cover 512 KiB of XIP code without aliasing
+/// (Felucca's image is 441 KiB; 64K lines re-decoded ~1M times per 6 s). Code below the XIP window
+/// (RAM: ISRs, flash drivers, a firmware's hot loop) has 64K lines of its own after them, so a
+/// RAM line and an XIP line never share a slot: with one map for both, Ravel's spin loop in RAM
+/// and the XIP code at the same slot evicted each other 54K times in 8 s, and in the wasm JIT
+/// each line decoded anew was a block made anew and a region compiled anew, without end.
+const ICACHE_BITS: u32 = 18;
+const ICACHE_RAM_BITS: u32 = 16;
+const ICACHE_LINES: usize = (1 << ICACHE_BITS) + (1 << ICACHE_RAM_BITS);
+
+#[inline(always)]
+fn icache_slot(pc: u32) -> usize {
+    if pc < 0x0200_0000 {
+        (1 << ICACHE_BITS) + ((pc >> 1) & ((1 << ICACHE_RAM_BITS) - 1)) as usize
+    } else {
+        ((pc >> 1) & ((1 << ICACHE_BITS) - 1)) as usize
+    }
+}
+
 impl Cpu {
     /// The core's state when it is plain: no pair in flight, no predicated block, no repeat
     /// loop, no interrupt in progress, no glued pair cut (None otherwise).
@@ -507,7 +560,19 @@ impl Cpu {
 
     pub fn jit_profile_json(&self) -> String {
         let helpers = self.jit_helpers.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
-        format!("{{\"entries\":{},\"instructions\":{},\"helpers\":{{{helpers}}}}}", self.jit_entries, self.jit_insns)
+        #[cfg(target_arch = "wasm32")]
+        let exits = {
+            let names = jit_wasm::EXIT_NAMES;
+            let (regions, drops, resets, blocks, compiled) = self.wjit.as_ref().map_or((0, 0, 0, 0, 0), |j| (j.regions, j.drops, j.resets, j.blocks, j.compiled_blocks()));
+            let (bytes, bytes_max) = self.wjit.as_ref().map_or((0, 0), |j| (j.bytes, j.bytes_max));
+            let e = names.iter().zip(self.exit_hist).filter(|(_, n)| *n > 0).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            let i = names.iter().zip(self.exit_insns).filter(|(_, n)| *n > 0).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            let m = ["ld_ram", "ld_xip", "ld_bus", "st_ram", "st_code", "st_bus"].iter().zip(self.mem_hist).map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+            format!(",\"exits\":{{{e}}},\"exit_insns\":{{{i}}},\"mem\":{{{m}}},\"regions\":{regions},\"bytes\":{bytes},\"bytes_max\":{bytes_max},\"drops\":{drops},\"resets\":{resets},\"region_blocks\":{blocks},\"compiled_blocks\":{compiled}")
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let exits = String::new();
+        format!("{{\"entries\":{},\"instructions\":{},\"insns\":{},\"helpers\":{{{helpers}}}{exits}}}", self.jit_entries, self.jit_insns, self.insn_count)
     }
 
     /// Count a JIT helper call when profiling. Called for every helper op, so the check is
@@ -582,14 +647,11 @@ impl Cpu {
     }
 
     fn fetch_at<B: Bus>(&mut self, bus: &mut B, pc: u32) -> Result<usize, CoreError> {
-        // 256K lines cover 512 KiB of code without aliasing (Felucca's
-        // image is 441 KiB; 64K lines re-decoded ~1M times per 6 s)
-        const BITS: u32 = 18;
         if self.icache.is_empty() {
-            self.icache = vec![Line::EMPTY; 1 << BITS];
-            self.icache_x = vec![None; 1 << BITS];
+            self.icache = vec![Line::EMPTY; ICACHE_LINES];
+            self.icache_x = vec![None; ICACHE_LINES];
         }
-        let slot = ((pc >> 1) & ((1 << BITS) - 1)) as usize;
+        let slot = icache_slot(pc);
         let hit = self.icache[slot].pc == pc;
         if hit && (0x0200_0000..0x0400_0000).contains(&pc) {
             return Ok(slot);
@@ -597,8 +659,14 @@ impl Cpu {
         let lo = bus.fetch32(pc) as u64;
         let hi = bus.fetch32(pc + 4) as u64;
         let win = (hi << 32) | lo;
-        if hit && self.icache_x[slot].map_or(false, |x| x.win == win) {
-            return Ok(slot);
+        // (RAM code: the line stands while the instruction's own bytes do; the rest of the window
+        // may be data a short instruction sits next to, which changing must not cost a decode)
+        if hit {
+            let len = self.icache[slot].len as u32;
+            let mask = if len >= 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
+            if self.icache_x[slot].map_or(false, |x| (x.win ^ win) & mask == 0) {
+                return Ok(slot);
+            }
         }
         self.decodes += 1;
         let insn = decode_any(win, pc).map_err(CoreError::Decode)?;
@@ -658,7 +726,10 @@ impl Cpu {
         if self.stop_pc != 0 {
             return self.run_stretch(bus, budget);
         }
-        self.run_fast_in::<B, false>(bus, budget)
+        if self.cost_model {
+            return self.run_fast_in::<B, false, true>(bus, budget);
+        }
+        self.run_fast_in::<B, false, false>(bus, budget)
     }
 
     /// `run_fast` as a runner's stretch (`stop_pc`): the same loop with the stretch's per-block
@@ -666,12 +737,17 @@ impl Cpu {
     /// there, interpreted Melodee ran 15% slower).
     #[inline(never)]
     fn run_stretch<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
-        self.run_fast_in::<B, true>(bus, budget)
+        if self.cost_model {
+            return self.run_fast_in::<B, true, true>(bus, budget);
+        }
+        self.run_fast_in::<B, true, false>(bus, budget)
     }
 
-    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`).
+    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`); `COST`: `cost_model` is
+    /// (FM1_STRICT's measured costs: a copy of the loop with them, so the default one has none of
+    /// their tests per instruction, which cost it 30%).
     #[inline(always)]
-    fn run_fast_in<B: Bus, const STRETCH: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+    fn run_fast_in<B: Bus, const STRETCH: bool, const COST: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
         if trace_on() {
             return Ok((0, false));
         }
@@ -707,6 +783,13 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             }
+            // (the PC limits: see `pc_win`)
+            let (outside, trip) = self.pc_enter(pc);
+            if trip {
+                self.pc_trip = true;
+                sync!();
+                return Ok((n, false));
+            }
             let blk = match self.block_at(bus, pc) {
                 Ok(b) => b,
                 Err(e) => {
@@ -722,16 +805,57 @@ impl Cpu {
             // only where calls end: see jit.rs's `compile`) if it is this block whole, else only
             // to its end
             let mut whole = false;
+            // (a stretch: a runner's call begins here)
+            let at_call = !stretch || n == bound;
             if stretch && n == bound {
                 let (to, all) = len_to(&self.bops[start as usize..(start + len) as usize], &self.swaps, pc, self.stop_pc);
                 bound = n + to;
                 whole = all;
             }
+            // A countdown loop of one instruction, `if (--R != #i) goto self` (a software delay:
+            // fm1-dock's core 1 spends half its time in one), is a block that branches to its own
+            // start: every iteration was a block, a run_fast call in a stretch (the stop pc lies in
+            // it), 60 M calls a second. Its iterations are pure (one register, no bus), so as many
+            // as fit the budget and the ticks before the next event run here in one go, before the
+            // JIT or the interpreter: the same state after the same number of instructions either
+            // way (the register one per iteration, the ticks as compiled code pays them).
+            if len == 1 && !careful && at_call {
+                // SAFETY: build_block pushed start into bops (as the loop below relies on)
+                let op = unsafe { *self.bops.get_unchecked(start as usize) };
+                if let Fast::DecBr { r, cond: Cond::Ne, v, target } = op.fast {
+                    if target == pc && !op.careful && !op.pair_head {
+                        let extra = if n == 0 { 0 } else { 1 };
+                        // (a stretch: as far as compiled code runs before the room check at a
+                        // block's entry stops it, `STRETCH_ROOM` short of the budget)
+                        let cap = if stretch { (budget - n).saturating_sub(STRETCH_ROOM) } else { budget - n };
+                        let room = (bus.tick_room() + 1).saturating_sub(extra).min(cap as u64);
+                        let r0 = self.regs[(r & 15) as usize];
+                        // iterations until the decremented register equals v (2^32 when it does now)
+                        let total = match r0.wrapping_sub(v) as u64 { 0 => 1 << 32, t => t };
+                        let k = total.min(room);
+                        if k > 0 {
+                            self.regs[(r & 15) as usize] = r0.wrapping_sub(k as u32);
+                            if k == total {
+                                pc += op.len as u32; // fell through
+                            }
+                            n += k as u32;
+                            bus.add_ticks(k - 1 + extra);
+                            if stretch {
+                                // the runner's call was this block: it ends here (and the runner
+                                // looks, as after a block run interpreted)
+                                bound = n;
+                                interpreted = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             let limit = if stretch { bound } else { budget };
             // (careful: inside a then-part or a rep loop with nothing else in progress, where a
             // compiled prefix that cannot reach the construct's end still runs: `prefix_inside`)
             #[cfg(native_jit)]
-            if self.jit_on && (!careful || self.only_construct()) {
+            if self.jit_on && !outside && (!careful || self.only_construct()) {
                 let inside = careful;
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
@@ -813,19 +937,24 @@ impl Cpu {
                 }
             }
             #[cfg(target_arch = "wasm32")]
-            if self.jit_on && !careful {
+            if self.jit_on && !outside && !careful {
                 if let Some(mem) = jit_mem {
                     if self.wjit.is_none() {
-                        self.wjit = jit_wasm::Jit::new(self.profile).map(Box::new);
+                        self.wjit = jit_wasm::Jit::new(self.profile).map(|mut j| {
+                            j.stops = self.stop_checks;
+                            Box::new(j)
+                        });
                     }
-                    let code = match self.wjit.as_mut().map(|j| j.lookup(id)) {
+                    let code = match self.wjit.as_mut().map(|j| j.lookup(id, pc)) {
                         // (a region with RAM blocks runs only while they are what memory holds)
                         Some((Some((f, at, r)), _)) => self.wasm_region_ok(bus, r).then_some((f, at)),
                         Some((None, true)) => {
                             // hot: compile its region (it runs from the next visit on)
                             let region = self.wasm_region(bus, id);
                             let ver = bus.code_writes().unwrap_or(u64::MAX);
-                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem, ver));
+                            // (profiling as the core is now: core 1 gets the flag after its release)
+                            let profile = self.profile;
+                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem, ver, profile));
                             if !ok {
                                 if let Some(j) = self.wjit.as_mut() {
                                     j.refuse(id);
@@ -838,20 +967,50 @@ impl Cpu {
                     if let Some((code, at)) = code {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
-                        // (the budget as the interpreter keeps it, to the instruction: each block
-                        // of the region runs only while it fits, else the interpreter goes on)
-                        let cap = limit - n;
+                        // a stretch's call of a block whole runs on, the code checking at each
+                        // block's entry where the runner wants it back (as jit.rs: the stop pc,
+                        // `stop_io`, the room); else the budget as the interpreter keeps it, to
+                        // the instruction: each block of the region runs only while it fits
+                        let open = stretch && whole && self.wjit.as_ref().is_some_and(|j| j.stops);
+                        let cap = if open { budget - n } else { limit - n };
                         // SAFETY: code was compiled for this bus type and memory map
                         let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
-                            // (a stretch: its helpers don't say whether they reached a peripheral)
-                            interpreted = true;
+                            if open {
+                                // (it left at a block's entry or after an op: the next call's
+                                // block begins where it stands)
+                                bound = n;
+                            } else {
+                                // (a stretch: its helpers don't say whether they reached a peripheral)
+                                interpreted = true;
+                            }
                             pc = self.pc;
                             // (it left between the two instructions of a glued pair, or inside an
                             // if-else block's then-part)
                             careful = self.hold_irq != 0 || !self.pred_skips.is_empty();
+                            // straight on to the region at pc when its own check is all that is
+                            // left of the way round this loop (`block_at` is pure, and what it
+                            // checks of a RAM block `wasm_region_ok` checks of all the region's);
+                            // not in a stretch, whose calls the loop above bounds. A region that
+                            // does not fit (k = 0) or was dropped: round the loop, as ever
+                            while !stretch && !careful && n < limit && !self.no_ram_blocks && !bus.next_tick_due() {
+                                let Some((f, at, r)) = self.wjit.as_ref().and_then(|j| j.cached(pc)) else { break };
+                                if !self.wasm_region_ok(bus, r) {
+                                    break;
+                                }
+                                sync!();
+                                // SAFETY: as above; n > 0: the first instruction's tick is due
+                                let k = unsafe { jit_wasm::run(f, at, self, bus, 1, limit - n) };
+                                if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
+                                if k == 0 {
+                                    break;
+                                }
+                                n += k;
+                                pc = self.pc;
+                                careful = self.hold_irq != 0 || !self.pred_skips.is_empty();
+                            }
                             continue;
                         }
                     }
@@ -894,15 +1053,45 @@ impl Cpu {
                 let next_pc = pc + op.len as u32;
                 if !(careful || op.careful) {
                     // plain micro-op: cannot start or end a pair, block or loop
+                    if COST {
+                        bus.fetch_cost(pc);
+                    }
                     pc = self.exec_fast(bus, op.fast, next_pc).unwrap_or(next_pc);
                     n += 1;
+                    if COST {
+                        let at = next_pc - op.len as u32;
+                        bus.add_ticks((op_cost8(&op.fast, op.len, pc != next_pc, pc < at) - 1) as u64);
+                    }
                 } else {
                     sync!();
+                    if COST {
+                        bus.fetch_cost(pc);
+                    }
                     // (it counts what it runs in insn_count itself; a swapped pair is two)
                     let r = self.exec_careful_op(bus, i, careful, next_pc, limit - n);
                     n += r & 3;
                     synced = n;
                     pc = self.pc;
+                    if COST {
+                        // (an op the plain path cannot run: each instruction it ran by its class,
+                        // as `step` charges them; each has had its one tick)
+                        let at = next_pc - op.len as u32;
+                        let k = (r & 3).max(1);
+                        let c = match op.fast {
+                            Fast::Swap { idx } => {
+                                let (head, tail, hlen) = self.swaps[idx as usize];
+                                let mid = at + hlen as u32;
+                                if k >= 2 {
+                                    bus.fetch_cost(mid);
+                                    op_cost8(&head, hlen, false, false) + op_cost8(&tail, op.len - hlen, pc != next_pc, pc < mid)
+                                } else {
+                                    op_cost8(&head, hlen, pc != mid, pc < at)
+                                }
+                            }
+                            f => op_cost8(&f, op.len, pc != next_pc, pc < at),
+                        };
+                        bus.add_ticks(c.saturating_sub(k) as u64);
+                    }
                     careful = r & 4 != 0;
                     if r & 8 != 0 {
                         return Ok((n, false));
@@ -1048,7 +1237,7 @@ impl Cpu {
             return Ok(None);
         }
         if !self.bmap.is_empty() {
-            let id = self.bmap[(pc >> 1) as usize & (self.bmap.len() - 1)];
+            let id = self.bmap[icache_slot(pc)];
             if id != 0 {
                 let (bpc, start, len) = self.blocks[id as usize - 1];
                 if bpc == pc && (xip || self.ram_block_ok(bus, id as usize - 1)) {
@@ -1105,15 +1294,20 @@ impl Cpu {
                 continue;
             }
             let Ok(Some((bid, start, len))) = self.block_at(bus, pc) else { continue };
+            // (a block the loop never ran: likely cold, left out; one compiled already: the
+            // region's exit chains into its region. Either gets a region of its own if it turns hot)
+            if !out.is_empty() && self.wjit.as_ref().is_some_and(|j| j.never_ran(bid) || j.compiled(bid)) {
+                continue;
+            }
             let all = &self.bops[start as usize..(start + len) as usize];
             let mut ops: Vec<BOp> = all.iter().take_while(|o| !o.careful).copied().collect();
             let (all_len, tail) = (all.len(), all.get(ops.len()).copied());
             // an if-else block at the end, its then-part plain: compiled with the then-part in
             // tow (`jit_wasm`'s IfBlk), going on at the else part or past it
             if let Some(last) = tail.filter(|_| ops.len() + 1 == all_len) {
-                if let Fast::IfBlk { has_else: true, fam, then_d, else_d, .. } = last.fast {
+                if let Fast::IfBlk { has_else: true, then_d, else_d, .. } = last.fast {
                     let next = pc + ops.iter().chain([&last]).map(|o| o.len as u32).sum::<u32>();
-                    if let Some(then) = (fam < 8).then(|| self.then_part(bus, next, then_d)).flatten() {
+                    if let Some(then) = self.then_part(bus, next, then_d) {
                         let then_end = next.wrapping_add(then_d as u32);
                         ops.push(last);
                         ops.extend(then);
@@ -1227,7 +1421,7 @@ impl Cpu {
         if self.bmap.is_empty() || (!ram_tracked && !(0x0200_0000..0x0400_0000).contains(&pc)) {
             return None;
         }
-        let id = self.bmap[(pc >> 1) as usize & (self.bmap.len() - 1)];
+        let id = self.bmap[icache_slot(pc)];
         if id == 0 || self.blocks[id as usize - 1].0 != pc {
             return None;
         }
@@ -1236,9 +1430,8 @@ impl Cpu {
 
     #[inline(never)]
     fn build_block<B: Bus>(&mut self, bus: &mut B, pc: u32) -> Result<Option<(usize, u32, u32)>, CoreError> {
-        const BITS: u32 = 18;
         if self.bmap.is_empty() {
-            self.bmap = vec![0; 1 << BITS];
+            self.bmap = vec![0; ICACHE_LINES];
         }
         if self.bops.len() > 1 << 22 {
             // (cannot happen for one image, but never grow without bound)
@@ -1317,7 +1510,7 @@ impl Cpu {
             self.bver.resize(self.blocks.len() - 1, u64::MAX);
             self.bver.push(bus.code_writes().unwrap_or(u64::MAX));
         }
-        let slot = (pc >> 1) as usize & ((1 << BITS) - 1);
+        let slot = icache_slot(pc);
         self.bmap[slot] = self.blocks.len() as u32;
         Ok(if len == 0 { None } else { Some((self.blocks.len() - 1, start, len)) })
     }
@@ -1363,9 +1556,47 @@ impl Cpu {
         jumped
     }
 
+    /// Code is about to run at `pc` (a block in `run_fast`, an instruction in a runner's reference
+    /// loop): (it is outside the PC limits `pc_win`, it is the first code out there since code
+    /// inside them: the exception is due after its first instruction).
+    #[inline]
+    pub fn pc_enter(&mut self, pc: u32) -> (bool, bool) {
+        let outside = self.pc_win.is_some_and(|w| !(w[0].0 <= pc && pc <= w[0].1) && !(w[1].0 <= pc && pc <= w[1].1));
+        let trip = outside && !self.pc_out;
+        self.pc_out = outside;
+        (outside, trip)
+    }
+
+    /// Fetch/decode/execute one instruction (`step_one`), and with `cost_model` its cost.
+    pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<(), CoreError> {
+        if self.isa_hist.is_some() {
+            let slot = self.fetch(bus)?;
+            if let (Some(x), Some(h)) = (self.icache_x[slot], self.isa_hist.as_mut()) {
+                *h.entry(x.entry.syntax).or_insert(0) += 1;
+            }
+        }
+        if !self.cost_model {
+            return self.step_one(bus);
+        }
+        let pc = self.pc;
+        let slot = self.fetch(bus)?;
+        let (fast, len) = (self.icache[slot].fast, self.icache[slot].len);
+        let named = self.icache_x[slot].map(|x| (x.entry.name, x.win));
+        bus.fetch_cost(pc);
+        self.step_one(bus)?;
+        let taken = self.pc != pc + len as u32;
+        let c = match (fast, named) {
+            (Some(f), _) => op_cost8(&f, len, taken, self.pc < pc),
+            (None, Some((name, raw))) => named_cost8(name, raw, taken),
+            (None, None) => if taken { 42 } else { 8 },
+        };
+        bus.add_ticks(c.saturating_sub(1) as u64);
+        Ok(())
+    }
+
     /// Fetch/decode/execute one instruction. Fetches a 6-byte window (the
     /// longest pi32v2 instruction); short instructions zero-extend.
-    pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<(), CoreError> {
+    fn step_one<B: Bus>(&mut self, bus: &mut B) -> Result<(), CoreError> {
         let slot = self.fetch(bus)?;
         let l = self.icache[slot];
         let next_pc = self.pc + l.len as u32;
@@ -2509,8 +2740,11 @@ impl Cpu {
             }
         };
         match s {
-            "nop" | "csync" | "lockclr" | "lockset" | "pfetch [R]"
+            "nop" | "csync" | "pfetch [R]"
             | "sti R" | "cli R" => {}
+            // freezes the trace unit's PC history (Felucca's and Dinghy's fault stub runs it
+            // first, so the crash report's ETM PCs are the ones before the fault): no trace here
+            "trigger" => {}
             // the core halts until an interrupt: the bus may let time pass
             "idle" => bus.idle(self.core_id),
             "sti" => self.ie = true,
@@ -2776,7 +3010,10 @@ impl Cpu {
                 // lockset / lockclr: the hardware lock the cores share (the stock RTOS takes
                 // it around every kernel critical section; with both cores running, a no-op
                 // let a task be queued on a wait list twice). Held by the other core: retry.
-                if !bus.hw_lock(self.core_id, name == "lockset_r") {
+                // (The table names them `lockset` / `lockclr`; spelled `lockset_r` here, this
+                // arm never ran and both fell through to the syntax executor's no-ops: FreeRTOS
+                // SMP in Bubba Machine then corrupted its lists at the first contention.)
+                if !bus.hw_lock(self.core_id, name == "lockset") {
                     jumped = Some(self.pc);
                 }
             }
@@ -3036,6 +3273,12 @@ impl Cpu {
                 let old = bus.read8(addr);
                 self.cc = old != 0;
                 bus.write8(addr, old | 0x80);
+                // taken, with `ifeq goto` back to it next (`40 e8 fd ff`: the SDK's byte
+                // spinlock): the core spins on this byte. A try-lock, or a claim-a-job byte
+                // that is often set, takes no such loop and records no wait.
+                if old != 0 && bus.fetch32(next_pc) == 0xfffd_e840 {
+                    bus.spin(self.core_id, addr);
+                }
             }
             24 => {
                 // `ifeq/ifne goto #off` (40/41 e8): off = 2*sext16(bits(16,31))
@@ -3554,6 +3797,10 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
             let entry = if (win >> 8) & 0xff == 0xf1 { &PAIR_OP_PAIR_RAW } else { &PAIR_OP_RAW };
             Ok(fm1_isa::Instruction { addr: pc, raw: win, entry })
         }
+        // `d8 e8` / `d4 e8 <mask>`: push / pop a register mask without rets. The
+        // table classes fit only observed masks; sparse masks need the raw decoder.
+        Err(_) if win & 0xffff == 0xe8d8 => raw(&PUSH_MASK_CRAW),
+        Err(_) if win & 0xffff == 0xe8d4 => raw(&POP_MASK_CRAW),
         // `d9 e8` / `d1 e8 <mask>`: push / pop of rets and a register mask; the table's
         // classes match only the masks the corpora used (libm's sin pops {rets, r11-r8, r6-r4})
         Err(_) if win & 0xffff == 0xe8d9 => raw(&RETS_PUSH_MASK_CRAW),
@@ -3584,8 +3831,8 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
             raw(if win & 0xffff == 0xf53f { &FPU_MAC_PAIR_CRAW } else { &FPU_MAC_CRAW })
         }
         // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
-        // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
-        // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
+        // `[R+#i] &= R`, `6e e8` `[R+#i] >>= R`, ...): the table's classes fit only the offsets
+        // the corpora used (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`), and had no `6e e8` at all
         Err(_) if decode_alu4(win & 0xffff_ffff).is_some() => raw(&ALU4_CRAW),
         // `d0..d7 ec`: word loads / stores at an offset or pre-incremented (route 18)
         Err(_) if matches!(win & 0xff, 0xd0..=0xd7) && (win >> 8) & 0xff == 0xec => raw(&WORD_MEM_CRAW),
@@ -3923,6 +4170,14 @@ static WORD_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "word_mem_craw", syntax: "[R+#i] = R (word raw)", len: 4, count: 0, mask: 0, match_: 0,
     group: "load", alt: &[], samples: &[], slots: &[],
 };
+static PUSH_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sp_push_mask_craw", syntax: "[--sp] = {R*2}", len: 4, count: 0, mask: 0, match_: 0,
+    group: "stack", alt: &[], samples: &[], slots: &[],
+};
+static POP_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sp_pop_mask_craw", syntax: "{R*2} = [sp++]", len: 4, count: 0, mask: 0, match_: 0,
+    group: "stack", alt: &[], samples: &[], slots: &[],
+};
 static RETS_PUSH_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "sp_mov_rets_mask_craw", syntax: "[--sp] = {rets, R*4}", len: 4, count: 0, mask: 0, match_: 0,
     group: "stack", alt: &[], samples: &[], slots: &[],
@@ -4246,13 +4501,20 @@ fn decode_alu4(raw: u64) -> Option<Alu4> {
                 rhs: Rhs::Bit(((raw >> 24) & 0xf) as usize),
             })
         }
-        0xe8 if matches!(b0, 0x64 | 0x68) => {
+        // `6e e8`: `[R+#i] <<= R` / `>>= R` / `>>>= R`, the register twin of `6c e8` (op bits
+        // 16-17 as there: 0 <<, 2 >>, 3 >>>; 1 is the vendor's saturating `<<<=`, not taken).
+        // No corpus had one; BB1 2.1.1's `6e e8 0a 01` [r0+8] >>= r1 halted the emulator. The
+        // layout checked on 64 encodings against the vendor objdump (`6f e8` is unknown to it).
+        0xe8 if matches!(b0, 0x64 | 0x68 | 0x6e) => {
             let op = match (b0, (raw >> 16) & 3) {
                 (0x64, 0) => Op::Or,
                 (0x64, 1) => Op::Xor,
                 (0x64, 2) => Op::And,
                 (0x68, 0) => Op::Add,
                 (0x68, 2) => Op::Sub,
+                (0x6e, 0) => Op::Shl,
+                (0x6e, 2) => Op::Shr,
+                (0x6e, 3) => Op::Sar,
                 _ => return None,
             };
             Some(Alu4 {
@@ -4677,6 +4939,35 @@ mod tests {
     }
 
     #[test]
+    fn lockset_retries_while_the_other_core_holds_it() {
+        // `41 00` = lockset, `40 00` = lockclr: the cores' hardware lock (`Bus::hw_lock`). Held
+        // by the other core, lockset retries (the pc stays); granted, it goes on; lockclr
+        // releases. (The ISA table names them `lockset` / `lockclr`: a route that spelled them
+        // `lockset_r` / `lockclr_r` never matched, and both ran as no-ops: no lock at all.)
+        struct LockRam { mem: Vec<u8>, grant: bool, calls: Vec<(u32, bool)> }
+        impl Bus for LockRam {
+            fn read8(&mut self, a: u32) -> u8 { *self.mem.get(a as usize).unwrap_or(&0) }
+            fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes([self.read8(a), self.read8(a + 1)]) }
+            fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes([self.read8(a), self.read8(a + 1), self.read8(a + 2), self.read8(a + 3)]) }
+            fn write8(&mut self, a: u32, v: u8) { if (a as usize) < self.mem.len() { self.mem[a as usize] = v; } }
+            fn write16(&mut self, a: u32, v: u16) { for (i, b) in v.to_le_bytes().iter().enumerate() { self.write8(a + i as u32, *b); } }
+            fn write32(&mut self, a: u32, v: u32) { for (i, b) in v.to_le_bytes().iter().enumerate() { self.write8(a + i as u32, *b); } }
+            fn hw_lock(&mut self, core: u32, set: bool) -> bool { self.calls.push((core, set)); !set || self.grant }
+        }
+        let mut ram = LockRam { mem: vec![0x41, 0x00, 0x40, 0x00, 0, 0, 0, 0], grant: false, calls: vec![] };
+        let mut cpu = Cpu::new(0);
+        cpu.core_id = 1;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.pc, 0, "held by the other core: lockset retries");
+        ram.grant = true;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.pc, 2, "granted: on to the next instruction");
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.pc, 4, "lockclr");
+        assert_eq!(ram.calls, vec![(1, true), (1, true), (1, false)]);
+    }
+
+    #[test]
     fn composed_matches_observed_table() {
         for (code, m, v) in MOV_H_TABLE {
             assert_eq!(
@@ -4718,6 +5009,31 @@ mod tests {
         cpu.step(&mut ram).unwrap();
         assert_eq!(ram.read32(0x48), 0x0000_f0f0 & 0x0f);
         assert_eq!(cpu.pc, 16);
+    }
+
+    #[test]
+    fn mem_shift_by_register() {
+        // `6e e8 0a 01` [r0+8] >>= r1 (BB1 2.1.1's, the first seen) ; `6e e8 00 05` [r0+0] <<= r5 ;
+        // `6e e8 0f 71` [r7+12] >>>= r1 ; `6e e8 01 01` [r0+0] <<<= r1 is not decoded
+        let mut mem = vec![0u8; 0x100];
+        mem[..12].copy_from_slice(&[0x6e, 0xe8, 0x0a, 0x01, 0x6e, 0xe8, 0x00, 0x05, 0x6e, 0xe8, 0x0f, 0x71]);
+        mem[0x40..0x44].copy_from_slice(&0x0000_0081u32.to_le_bytes());
+        mem[0x48..0x4c].copy_from_slice(&0x8000_0f00u32.to_le_bytes());
+        mem[0x5c..0x60].copy_from_slice(&0xffff_ff00u32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[0] = 0x40;
+        cpu.regs[7] = 0x50;
+        cpu.regs[1] = 4;
+        cpu.regs[5] = 33; // (a shift by a register counts modulo 32)
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x48), 0x0800_00f0, "[r0+8] >>= r1: logical");
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x40), 0x0000_0102, "[r0+0] <<= r5");
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x5c), 0xffff_fff0, "[r7+12] >>>= r1: arithmetic");
+        assert_eq!(cpu.pc, 12);
+        assert!(decode_alu4(0x0101_e86e).is_none(), "the saturating <<<= is not taken");
     }
 
     #[test]
@@ -5382,6 +5698,25 @@ mod tests {
     }
 
     #[test]
+    fn push_pop_sparse_register_mask_without_rets() {
+        let mut mem = vec![0u8; 0x200];
+        mem[..8].copy_from_slice(&[0xd8, 0xe8, 0xf0, 0x0d, 0xd4, 0xe8, 0xf0, 0x0d]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.sp = 0x200;
+        for r in 0..16 { cpu.regs[r] = 0x100 + r as u32; }
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.sp, 0x200 - 4 * 7);
+        assert_eq!(ram.read32(0x1fc), 0x10b);
+        assert_eq!(ram.read32(0x200 - 28), 0x104);
+        for r in 0..16 { cpu.regs[r] = 0; }
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.sp, 0x200);
+        assert_eq!(cpu.pc, 8);
+        assert_eq!((cpu.regs[4], cpu.regs[8], cpu.regs[9], cpu.regs[10], cpu.regs[11]), (0x104, 0x108, 0, 0x10a, 0x10b));
+    }
+
+    #[test]
     fn push_pop_register_mask() {
         // `d9 e8 f0 0d` [--sp] = {rets, r11, r10, r8-r4}, `d5 e8 f0 0d` the matching pop
         let mut mem = vec![0u8; 0x200];
@@ -5912,6 +6247,45 @@ mod tests {
         assert!(bus.0.mem == sbus.0.mem);
     }
 
+    #[test]
+    fn strict_costs_of_a_swapped_pair_match_step() {
+        // `cost_model`: a pair the block builder swaps (`Fast::Swap`) costs what its two
+        // instructions cost stepped one at a time (once the head's class times two, or `_ => 5`)
+        struct Clocked { ram: FlatRam, ticks: u64 }
+        impl Bus for Clocked {
+            fn read8(&mut self, a: u32) -> u8 { self.ram.read8(a & 0xffff) }
+            fn read16(&mut self, a: u32) -> u16 { self.ram.read16(a & 0xffff) }
+            fn read32(&mut self, a: u32) -> u32 { self.ram.read32(a & 0xffff) }
+            fn write8(&mut self, a: u32, v: u8) { self.ram.write8(a & 0xffff, v) }
+            fn write16(&mut self, a: u32, v: u16) { self.ram.write16(a & 0xffff, v) }
+            fn write32(&mut self, a: u32, v: u32) { self.ram.write32(a & 0xffff, v) }
+            fn tick(&mut self) -> bool { self.ticks += 1; false }
+            fn next_tick_due(&self) -> bool { false }
+            fn add_ticks(&mut self, n: u64) { self.ticks += n; }
+        }
+        // (as `swapped_pair_in_a_block`: `00 d7` paired with `c8 4b`, then two nops)
+        let code = [0x00, 0xd7, 0xc8, 0x4b, 0x00, 0x00, 0x00, 0x00];
+        let fresh = || {
+            let mut mem = vec![0u8; 0x10000];
+            mem[..code.len()].copy_from_slice(&code);
+            let mut cpu = Cpu::new(0x0200_0000);
+            (cpu.regs[0], cpu.regs[4]) = (0x1234_5678, 0x1000);
+            cpu.cost_model = true;
+            (cpu, Clocked { ram: FlatRam::new(mem), ticks: 0 })
+        };
+        let (mut stepped, mut sbus) = fresh();
+        for _ in 0..4 {
+            sbus.tick(); // (the runner's tick, one an instruction)
+            stepped.step(&mut sbus).unwrap();
+        }
+        let (mut cpu, mut bus) = fresh();
+        bus.tick(); // (the first instruction's tick is the runner's: `run_blocks`)
+        assert_eq!(cpu.run_fast(&mut bus, 4).unwrap().0, 4);
+        assert!(matches!(cpu.bops[0].fast, Fast::Swap { .. }), "{:?}", cpu.bops[0]);
+        assert_eq!(cpu.pc, stepped.pc);
+        assert_eq!(bus.ticks, sbus.ticks, "blocks against step");
+    }
+
     /// A test bus with a clock and an interrupt source: XIP code at 0x0200_0000, RAM at 0; a
     /// write to `MMIO` and up raises the interrupt (odd value) or clears it (even), and makes the
     /// next tick due when `due_on_mmio` (as the Soc's peripherals do; core 1's bus does not).
@@ -6439,7 +6813,7 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if bittest.is_some() => 0,
             _ if alu4.is_some() => 1,
             "nop" | "csync" | "sti_r" | "cli_r" => 2,
-            "lockclr_r" | "lockset_r" => 3,
+            "lockclr" | "lockset" => 3,
             "r_mov_i_l2" => 4,
             "sp_mov_i" => 5,
             "ssp_mov_i" => 6,
@@ -6574,6 +6948,63 @@ impl Cond {
         matches!(self, Cond::FEq | Cond::FUne | Cond::FLt | Cond::FUge | Cond::FLe | Cond::FUgt
             | Cond::FGe | Cond::FUlt | Cond::FGt | Cond::FUle)
     }
+}
+
+/// What an op costs on an FM-1, in eighths of a 240 MHz cycle (`Cpu::cost_model`), from harbor's
+/// cycles probe on a real FM-1 (2026-10-24, probes/cycles.c: one instruction a statement, run from
+/// RAM): plain ALU ops ~0.6 (two a cycle), a 6-byte constant 1.08, a multiply 1.9, a divide 6.75,
+/// loads 1.25, stores 1.4, a push or pop ~1.25 + 1 a register, a goto 5.2, a conditional branch
+/// taken 6.5 forward and ~4.75 backward (a loop's branch: the core predicts it), not taken 0.85, a
+/// call or a return ~5; (probes/cycles2.c) FPU add / subtract / multiply 1.375, divide 2.66, a 64-bit
+/// multiply(-accumulate) ~3.2. `taken`: it left its fall-through; `back`: to a lower address. Not in
+/// it: XIP's cache (fm1_soc's `XipCache`) and load-use stalls.
+fn op_cost8(f: &Fast, len: u8, taken: bool, back: bool) -> u32 {
+    let br = if back { 38 } else { 52 };
+    let mask = |m: u16| m.count_ones();
+    let range = |n: u8| (n as u32).saturating_sub(3);       // {rN-r4}: N - 3 registers
+    match *f {
+        Fast::MovI { .. } if len >= 6 => 9,
+        Fast::Alu3 { op: Op::Mul, .. } | Fast::Alu3I { op: Op::Mul, .. } | Fast::Alu2 { op: Op::Mul, .. }
+        | Fast::Alu2I { op: Op::Mul, .. } => 15,
+        Fast::Div { .. } => 54,
+        Fast::Ld { .. } | Fast::LdW { .. } | Fast::LdWSp { .. } | Fast::LdBu { .. } | Fast::LdIdx { .. }
+        | Fast::LdPost { .. } | Fast::LdPre { .. } | Fast::LdPostR { .. } => 10,
+        Fast::St { .. } | Fast::StW { .. } | Fast::StWSp { .. } | Fast::StIdx { .. } | Fast::StPost { .. }
+        | Fast::StPre { .. } | Fast::StPostR { .. } => 11,
+        Fast::LdPair { .. } => 20,
+        Fast::StPair { .. } => 22,
+        Fast::Rmw { .. } => 21,
+        Fast::PushMask { mask: m } | Fast::PopMask { mask: m } => 10 + 8 * mask(m),
+        Fast::BlockMove { mask: m, .. } => 10 + 9 * mask(m),
+        Fast::PushRets { n } => 18 + 8 * range(n),
+        Fast::PopPc { n } => 50 + 8 * range(n),
+        Fast::PushRet | Fast::PopRets => 18,
+        Fast::PopRet => 50,
+        Fast::Call { .. } | Fast::CallR { .. } | Fast::Rts => 40,
+        Fast::Goto { .. } | Fast::GotoR { .. } | Fast::Tb { .. } => if back { 38 } else { 42 },
+        Fast::BrI { .. } | Fast::BrR { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. } | Fast::BitBr { .. }
+        | Fast::DecBr { .. } => if taken { br } else { 7 },
+        Fast::FOp { op: 0..=2, .. } => 11,
+        Fast::FOp { op: 3, .. } => 21,
+        Fast::FOp { .. } => 9,
+        // the 64-bit products and multiply-accumulates (`f8 e1` rP = rA * rB, `fc e1` +=, `fe e1` -=)
+        Fast::Raw { raw, .. } if raw & 0xff00 == 0xe100 && matches!(raw & 0xfe, 0xf8 | 0xfc | 0xfe) => 25,
+        _ => if taken { if back { 38 } else { 42 } } else { 5 },
+    }
+}
+
+/// `op_cost8` for an instruction with no micro-op (`fast_of` None), by its ISA entry's name: the
+/// 2-byte push / pop forms (`[--sp] = {rets, rN-r4}`, `{pc, rN-r4} = [sp++]`: N - 3 registers, and
+/// rets or pc) as the 4-byte masks, a pop into pc a return too; anything else one cycle, or a
+/// taken branch's when it left its fall-through.
+fn named_cost8(name: &str, raw: u64, taken: bool) -> u32 {
+    let push = name.starts_with("sp_mov_");
+    let pop = name.contains("_mov_sp");
+    if push || pop {
+        let regs = ((raw & 0xf) as u32).saturating_sub(3) + (name.contains("rets") || name.starts_with("pc_")) as u32;
+        return 10 + 8 * regs + if taken { 40 } else { 0 };
+    }
+    if taken { 42 } else { 8 }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6759,7 +7190,7 @@ fn alu(op: Op, a: u32, b: u32) -> u32 {
 }
 
 /// `cmp_cond(fam, alt, ..)` as a `Cond`.
-fn cond_of_fam(fam: u64, alt: bool) -> Cond {
+pub(crate) fn cond_of_fam(fam: u64, alt: bool) -> Cond {
     match (fam, alt) {
         (0, false) => Cond::Eq,
         (0, true) => Cond::Ne,

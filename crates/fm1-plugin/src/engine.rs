@@ -52,8 +52,10 @@ pub enum Cmd {
     /// SMK-37: an analog input (fm1_soc::smk's ANALOG_*), the next keys' velocity (µs)
     Analog { idx: u8, value: u16 },
     Vel(u32),
-    /// The ring's lead in frames (from the host's block size).
-    Lead(usize),
+    /// The host's block in the machine's frames: the ring's lead is that plus the Lead parameter.
+    Block(usize),
+    /// Start a WAV of the output, or finish the one being written.
+    Record,
 }
 
 /// What the editor shows: the screen, the LEDs and how the machine is doing.
@@ -92,7 +94,8 @@ struct Machine {
 }
 
 impl Machine {
-    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64) -> Result<Self, String> {
+    /// `lcd_timed`: the LCD's transfers take their time, as on an FM-1 (fm1_soc's `Soc::lcd_timed`)
+    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64, lcd_timed: bool) -> Result<Self, String> {
         crate::savefile::validate_sectors(&sectors.iter().map(|(at, data)| crate::Sector {
             at: *at, data: Arc::new(data.clone()),
         }).collect::<Vec<_>>())?;
@@ -102,6 +105,7 @@ impl Machine {
         soc.periph.hz = mhz * 1_000_000;
         soc.periph.skip_idle = true;
         soc.periph.midi_speed = MIDI_SPEED;
+        soc.lcd_timed = lcd_timed;
         let mut cpu = Cpu::new(st.entry);
         cpu.jit_on = true;
         cpu.user = true; // the SPL hands cpu0 over in user mode (fm1-core's Cpu::user)
@@ -129,7 +133,7 @@ impl Machine {
             return Err("the firmware has stopped".into());
         }
         let sectors = self.changed_sectors();
-        let fresh = Machine::boot(pkg, &sectors, self.soc.periph.hz / 1_000_000)?;
+        let fresh = Machine::boot(pkg, &sectors, self.soc.periph.hz / 1_000_000, self.soc.lcd_timed)?;
         let state = fm1_soc::state::save(&self.cpu, self.cpu1.as_ref(), &self.soc, self.pending_tick, &fresh.soc)?;
         Ok((sectors, state))
     }
@@ -137,7 +141,7 @@ impl Machine {
     /// The machine a save-state was taken of, from the package and flash it was saved with.
     fn restore(pkg: &[u8], sectors: &[(u32, Vec<u8>)], state: &[u8]) -> Result<Self, String> {
         let hz = fm1_soc::state::clock_hz(state).ok_or("not a machine state")?;
-        let fresh = Machine::boot(pkg, sectors, hz / 1_000_000)?;
+        let fresh = Machine::boot(pkg, sectors, hz / 1_000_000, fm1_soc::lcd_timed_from_env())?;
         let mut m = fm1_soc::state::restore(state, fresh.soc)?;
         m.soc.periph.midi_speed = MIDI_SPEED;
         Ok(Machine { cpu: m.cpu, cpu1: m.cpu1, soc: m.soc, pending_tick: m.pending_tick, halted: false, flash0: fresh.flash0 })
@@ -219,7 +223,9 @@ pub fn run(
     mut out: rtrb::Producer<[f32; 2]>,
 ) {
     let mut m: Option<Machine> = None;
-    let mut lead = 2048usize;
+    // the instant LCD unless the host's environment asks for the timed one (FM1_LCD_TIMED)
+    let lcd_timed = fm1_soc::lcd_timed_from_env();
+    let mut block = 1024usize;
     let mut made: u64 = 0; // frames pushed since boot
     let mut due: VecDeque<Midi> = VecDeque::new();
     let mut pot = u16::MAX;
@@ -233,12 +239,13 @@ pub fn run(
     let mut active_pkg: Option<Arc<Vec<u8>>> = None;
     let mut pending = Vec::new();
     let (mut speed_t, mut speed_ms, mut busy, mut starved0) = (Instant::now(), 0u64, Duration::ZERO, 0u64);
+    let mut rec: Option<crate::wav::Wav> = None;
     while !shared.quit.load(Ordering::Relaxed) {
         while let Ok(c) = cmds.try_recv() {
             let (c, prepared, loaded) = match c {
                 Cmd::Load { firmware, sectors, reply } => {
                     let sectors: Sectors = sectors.iter().map(|s| (s.at, s.data.to_vec())).collect();
-                    match Machine::boot(&firmware.pkg, &sectors, params.clock.value().mhz()) {
+                    match Machine::boot(&firmware.pkg, &sectors, params.clock.value().mhz(), lcd_timed) {
                         Ok(next) => (Cmd::Boot { pkg: firmware.pkg.clone(), sectors }, Some(next), Some((firmware, reply))),
                         Err(error) => { let _ = reply.send(Err(error)); continue; }
                     }
@@ -253,7 +260,7 @@ pub fn run(
             match c {
                 Cmd::Boot { pkg, sectors } => {
                     cancel_snapshots(&mut pending);
-                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz()).ok());
+                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz(), lcd_timed).ok());
                     active_pkg = m.as_ref().map(|_| pkg);
                     pot = u16::MAX;
                     let mut v = shared.view.lock().unwrap();
@@ -302,19 +309,22 @@ pub fn run(
                 Cmd::Analog { idx, value } => apply(&mut m, Action::Adc { ch: idx, value: value.min(1023) }),
                 Cmd::Vel(us) => {
                     if let Some(m) = m.as_mut() {
-                        m.soc.periph.smk_vel = (m.soc.periph.hz as u128 * us as u128 / 1_000_000) as u64;
+                        m.soc.periph.smk_vel_us = us;
                     }
                 }
-                Cmd::Lead(l) => lead = l,
+                Cmd::Block(b) => block = b,
+                Cmd::Record => record(&mut rec, &params),
             }
         }
+        // the ring's lead: the host's block and the Lead parameter, as the window sets it
+        let lead = block + params.lead.value().frames();
         // a new clock: the machine's timers count its cycles, so boot it again on the new one,
         // with what the firmware wrote to its flash
         let mhz = params.clock.value().mhz();
         if let (Some(mm), Some(pkg)) = (m.as_ref(), active_pkg.as_ref()) {
             if mm.soc.periph.hz != mhz * 1_000_000 && pending.is_empty() {
                 let sectors = mm.changed_sectors();
-                if let Ok(next) = Machine::boot(pkg, &sectors, mhz) {
+                if let Ok(next) = Machine::boot(pkg, &sectors, mhz, lcd_timed) {
                     m = Some(next);
                     pot = u16::MAX;
                     due.clear();
@@ -376,6 +386,13 @@ pub fn run(
             mm.run(20_000);
             busy += t0.elapsed();
             let a = std::mem::take(&mut mm.soc.periph.audio);
+            if let Some(w) = rec.as_mut() {
+                w.write(&a);
+                // a failed write or the size limit: the take ends here, and the window says why
+                if w.error.is_some() {
+                    record(&mut rec, &params);
+                }
+            }
             for f in a.chunks_exact(2) {
                 // (a full ring drops the frame: the host has stopped taking them)
                 if out.push([f[0] as f32 / 32768.0, f[1] as f32 / 32768.0]).is_ok() {
@@ -385,6 +402,7 @@ pub fn run(
         }
         if last_view.elapsed() >= Duration::from_millis(30) {
             last_view = Instant::now();
+            params.rec.lock().unwrap().file = rec.as_ref().map(|w| (w.path.clone(), w.frames));
             let mut v = shared.view.lock().unwrap();
             v.lcd.copy_from_slice(&mm.soc.lcd.fb);
             v.leds = if mm.soc.board == Board::Smk37 {
@@ -417,6 +435,35 @@ pub fn run(
             }
         }
     }
+    // the plugin closed while recording: the file keeps what was played, with its length
+    if let Some(w) = rec.take() {
+        let _ = w.finish();
+    }
+}
+
+/// Start a WAV of the output (in the Music folder's fm1-emu, named after the firmware), or
+/// finish the one being written; what happened goes to the window.
+fn record(rec: &mut Option<crate::wav::Wav>, params: &crate::Fm1Params) {
+    let msg = match rec.take() {
+        Some(w) => match w.finish() {
+            Ok(p) => format!("Recorded {}", p.display()),
+            Err(e) => format!("Recording: {e}"),
+        },
+        None => {
+            let name = params.firmware.lock().unwrap().name.clone();
+            match crate::wav::Wav::create(if name.is_empty() { "fm1" } else { &name }) {
+                Ok(w) => {
+                    let m = format!("Recording to {}", w.path.display());
+                    *rec = Some(w);
+                    m
+                }
+                Err(e) => format!("Recording: {e}"),
+            }
+        }
+    };
+    let mut r = params.rec.lock().unwrap();
+    r.file = rec.as_ref().map(|w| (w.path.clone(), w.frames));
+    r.msg = Some(msg);
 }
 
 fn apply(m: &mut Option<Machine>, a: Action) {
@@ -493,7 +540,7 @@ mod portable_tests {
         let midi = |m: &mut Machine, bytes: &[u8]| bytes.iter().for_each(|&b| m.soc.periph.apply(&Action::Midi { b }));
 
         // a session: another preset, knobs turned, a chord still sounding when it is saved
-        let (mut a, mut heard) = (Machine::boot(&pkg, &[], 240).unwrap(), Vec::new());
+        let (mut a, mut heard) = (Machine::boot(&pkg, &[], 240, fm1_soc::lcd_timed_from_env()).unwrap(), Vec::new());
         play(&mut a, 3000, &mut heard);
         a.soc.periph.apply(&Action::Enc { enc: 6, clicks: 2 });
         a.soc.periph.apply(&Action::Enc { enc: 2, clicks: -9 });

@@ -18,6 +18,9 @@ mod engine;
 #[path = "../../../crates/fm1-plugin/src/savefile.rs"]
 #[allow(dead_code)]
 mod savefile;
+#[path = "../../../crates/fm1-live/src/wav.rs"]
+#[allow(dead_code)]
+mod wav;
 
 use engine::{Cmd, Midi, Shared, View};
 
@@ -78,6 +81,32 @@ impl ClockParam {
     }
 }
 
+/// Upstream's Lead parameter: frames the ring runs ahead beyond the host's block. FM-1Ception sends
+/// the whole lead as the block (`fm1e_set_lead`), so this is none.
+#[derive(Clone, Copy)]
+pub struct Lead(usize);
+
+impl Lead {
+    pub fn frames(self) -> usize {
+        self.0
+    }
+}
+
+pub struct LeadParam(Lead);
+
+impl LeadParam {
+    pub fn value(&self) -> Lead {
+        self.0
+    }
+}
+
+/// Upstream's recorder view (its window's REC); FM-1Ception does not record yet.
+#[derive(Default)]
+pub struct RecView {
+    pub file: Option<(std::path::PathBuf, u64)>,
+    pub msg: Option<String>,
+}
+
 pub struct Fm1Params {
     pub firmware: Mutex<Firmware>,
     pub flash: Mutex<Vec<Sector>>,
@@ -85,6 +114,8 @@ pub struct Fm1Params {
     pub master: Level,
     /// The emulated clock. Changing it reboots the firmware, keeping its flash.
     pub clock: ClockParam,
+    pub lead: LeadParam,
+    pub rec: Mutex<RecView>,
 }
 
 impl Default for Fm1Params {
@@ -94,6 +125,8 @@ impl Default for Fm1Params {
             flash: Mutex::new(Vec::new()),
             master: Level(AtomicU32::new((900.0f32 / 1023.0).to_bits())),
             clock: ClockParam(AtomicU32::new(default_mhz(jit_available()))),
+            lead: LeadParam(Lead(0)),
+            rec: Mutex::new(RecView::default()),
         }
     }
 }
@@ -408,7 +441,8 @@ pub extern "C" fn fm1e_default_mhz() -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn fm1e_set_lead(e: *const Fm1e, frames: u32) {
     let e = &*e;
-    let _ = e.cmds.send(Cmd::Lead((frames as usize).clamp(64, AUDIO_RING - 4096)));
+    // the whole lead, as upstream's host block (its Lead parameter adds none here)
+    let _ = e.cmds.send(Cmd::Block((frames as usize).clamp(64, AUDIO_RING - 4096)));
 }
 
 /// # Safety

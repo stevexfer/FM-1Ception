@@ -91,7 +91,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fm1-core"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "fm1-isa",
  "serde",
@@ -99,11 +99,11 @@ dependencies = [
 
 [[package]]
 name = "fm1-isa"
-version = "0.3.0"
+version = "0.5.1"
 
 [[package]]
 name = "fm1-soc"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "bincode",
  "fm1-core",

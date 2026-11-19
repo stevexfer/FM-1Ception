@@ -21,6 +21,8 @@ work/isa_stats_new.json
 work/probe/
 work/probe_*.bin
 work/*.ppm
+work/*.mp4
+work/audio.raw
 work/session.html
 
 # the browser build (web/build.sh)
@@ -29,3 +31,4 @@ _site/
 
 # tools/hwdsp.py run: raw results (tests/hwdsp/fm1.txt is the reference, from export)
 tests/hwdsp/*.json
+work/film/

@@ -35,6 +35,7 @@ struct Machine {
     halted: bool,
     flash0: Vec<u8>,
     usr: Option<usize>,
+    usr_layout: fm1_soc::fwsc::UsrLayout,
     started: bool,
     pace: Pace,
 }
@@ -123,6 +124,10 @@ impl Machine {
         soc.periph.hz = mhz as u64 * 1_000_000;
         soc.periph.skip_idle = true;
         soc.periph.frame_ns = match unsafe { FRAME_NS } { 0 => None, ns => Some(ns as u64) };
+        soc.lcd_timed = unsafe { LCD_TIMED };
+        soc.cpu1_survives = unsafe { CPU1_SURVIVES };
+        // (before the boot: the board sets the flash chip's id from it)
+        soc.set_flash_part(flash_part(unsafe { FLASH_PART }));
         let mut cpu = Cpu::new(entry);
         // (cpu1 follows cpu0's setting: run_dual)
         cpu.jit_on = unsafe { JIT };
@@ -135,7 +140,7 @@ impl Machine {
         }
         let flash0 = soc.flash.mem.clone();
         Machine { cpu, cpu1: None, soc, pending_tick: false, audio: VecDeque::new(), halted: false,
-            flash0, usr: None, started: false, pace: Pace::default() }
+            flash0, usr: None, usr_layout: fm1_soc::fwsc::UsrLayout::FM1, started: false, pace: Pace::default() }
     }
 
     // Runtime SPI writes replace complete ranges in XIP, including bytes that happen
@@ -171,7 +176,7 @@ impl Machine {
         if self.started { return false; }
         let Some(usr) = self.usr else { return false };
         let mut flash = self.soc.flash.mem.clone();
-        if fm1_soc::fwsc::usr_load_syx(&mut flash, usr, bank, 0).is_err() { return false; }
+        if fm1_soc::fwsc::usr_load_syx(&mut flash, usr, self.usr_layout, bank, 0).is_err() { return false; }
         // Only bank sectors were written; preserve decrypted code elsewhere.
         for at in (0..flash.len()).step_by(4096) {
             if flash[at..at + 4096] != self.soc.flash.mem[at..at + 4096] {
@@ -196,6 +201,12 @@ static mut M: Option<Machine> = None;
 static mut JIT: bool = false;
 static mut JIT_PER_RENDER: u32 = 0;
 static mut AHEAD: u32 = 0;
+/// `fm1_lcd_timed`: the next boot's `Soc::lcd_timed`
+static mut LCD_TIMED: bool = false;
+/// `fm1_cpu1_survives`: a fault on core 1 stops that core alone and cpu0 goes on (`Soc::cpu1_survives`)
+static mut CPU1_SURVIVES: bool = false;
+/// `fm1_flash_part`: the next boot's FM-1 flash part (0 the stock Puya P25Q80, 1 the UC25HQ80)
+static mut FLASH_PART: u32 = 0;
 static mut OUT_L: [f32; 1024] = [0.0; 1024];
 static mut OUT_R: [f32; 1024] = [0.0; 1024];
 static mut LEDS: [f32; 41] = [0.0; 41];
@@ -239,6 +250,7 @@ pub extern "C" fn fm1_boot_fwsc(ptr: *mut u8, len: u32, syx: *mut u8, syx_len: u
         Ok(st) => {
             let mut m = Machine::new(st.xip, st.entry, mhz, Some((&st.flash, st.board)));
             m.usr = st.usr;
+            m.usr_layout = st.usr_layout;
             if bank.as_deref().is_some_and(|b| !m.load_syx(b)) { return 1; }
             unsafe { M = Some(m) };
             0
@@ -302,6 +314,13 @@ pub extern "C" fn fm1_jit(on: u32, per_render: u32) {
     }
 }
 
+/// The LCD's transfers take their time at the SPI clock, as on an FM-1 (`on` = 1; fm1_soc's
+/// `Soc::lcd_timed`), from the next boot on. Off by default: they finish at once.
+#[no_mangle]
+pub extern "C" fn fm1_lcd_timed(on: u32) {
+    unsafe { LCD_TIMED = on != 0 };
+}
+
 /// Optional profiling, disabled during throughput measurements. Turn it on before the first
 /// fm1_render: the JIT, made then, compiles helper calls that count themselves only if it is.
 #[no_mangle]
@@ -320,6 +339,35 @@ pub extern "C" fn fm1_profile_report() -> *const u8 {
         PROFILE_JSON = report.into_bytes();
         PROFILE_JSON.push(0);
         PROFILE_JSON.as_ptr()
+    }
+}
+
+/// The wasm JIT's inline FPU ops against the interpreter in this engine (jit_wasm.rs
+/// `fop_selftest`, web/jit.test.mjs): the mismatches, 0 when all agree (and on a host without
+/// the wasm JIT).
+#[no_mangle]
+pub extern "C" fn fm1_jit_selftest() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        fm1_core::jit_wasm::fop_selftest() + fm1_core::jit_wasm::int_selftest()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    0
+}
+
+static mut SELFTEST_DETAIL: Vec<u8> = Vec::new();
+/// The mismatches `fm1_jit_selftest` found, one per line, NUL-terminated (empty: none).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn fm1_jit_selftest_detail() -> *const u8 {
+    #[cfg(target_arch = "wasm32")]
+    let detail = fm1_core::jit_wasm::fop_selftest_detail();
+    #[cfg(not(target_arch = "wasm32"))]
+    let detail = "";
+    unsafe {
+        SELFTEST_DETAIL = detail.as_bytes().to_vec();
+        SELFTEST_DETAIL.push(0);
+        SELFTEST_DETAIL.as_ptr()
     }
 }
 
@@ -384,6 +432,29 @@ pub extern "C" fn fm1_render(frames: u32, max_insns: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn fm1_ahead(frames: u32) {
     unsafe { AHEAD = frames };
+}
+
+/// A fault on core 1 stops that core alone and cpu0 goes on, as the chip's would (`on` = 1;
+/// `Soc::cpu1_survives`), for a firmware whose core 1 fails on the chip too (COSMOS 0.23).
+/// Off, the default, the machine halts there: most such faults are the emulator's own gaps.
+fn flash_part(n: u32) -> fm1_soc::FlashPart {
+    if n == 1 { fm1_soc::FlashPart::Uc25hq80 } else { fm1_soc::FlashPart::P25q80 }
+}
+
+/// Which part the FM-1's flash is: 0 the stock Puya P25Q80 (JEDEC 85 60 14), 1 the UC25HQ80
+/// (B3 60 14) of units sold since autumn 2026. Before the boot, or for the machine running (a
+/// firmware reads the id at its start, so the running one goes on as it began).
+#[no_mangle]
+pub extern "C" fn fm1_flash_part(part: u32) {
+    unsafe { FLASH_PART = part };
+    if let Some(m) = machine() { m.soc.set_flash_part(flash_part(part)); }
+}
+
+/// Before the boot, or for the machine running.
+#[no_mangle]
+pub extern "C" fn fm1_cpu1_survives(on: u32) {
+    unsafe { CPU1_SURVIVES = on != 0 };
+    if let Some(m) = machine() { m.soc.cpu1_survives = on != 0; }
 }
 
 #[no_mangle]
@@ -502,7 +573,7 @@ pub extern "C" fn fm1_analog(idx: u32, value: u32) {
 #[no_mangle]
 pub extern "C" fn fm1_velocity(us: u32) {
     if let Some(m) = machine() {
-        m.soc.periph.smk_vel = (m.soc.periph.hz as u128 * us as u128 / 1_000_000) as u64;
+        m.soc.periph.smk_vel_us = us;
     }
 }
 
@@ -574,6 +645,13 @@ pub extern "C" fn fm1_minsns() -> u32 {
 #[no_mangle]
 pub extern "C" fn fm1_halted() -> u32 {
     machine().map_or(1, |m| m.halted as u32)
+}
+
+/// 1 once core 1 stopped on an instruction it could not run (`Soc::cpu1_fault`): the chip's
+/// core would fault there, and cpu0 goes on alone. The page may say so.
+#[no_mangle]
+pub extern "C" fn fm1_cpu1_fault() -> u32 {
+    machine().map_or(0, |m| m.soc.cpu1_fault.is_some() as u32)
 }
 
 // ---------------------------------------------------------------- the front panel (page side)
@@ -839,7 +917,7 @@ mod persistence_tests {
         assert!(m.restore(&record(0x74000, 0x17)));
         let bank = vec![0x23; 4096];
         let mut expected = m.soc.flash.mem.clone();
-        fm1_soc::fwsc::usr_load_syx(&mut expected, 0xe0000, &bank, 0).unwrap();
+        fm1_soc::fwsc::usr_load_syx(&mut expected, 0xe0000, fm1_soc::fwsc::UsrLayout::FM1, &bank, 0).unwrap();
         assert!(m.load_syx(&bank));
         assert_eq!(m.soc.flash.mem, expected);
         assert_eq!(m.soc.read32(0x02000000), 0x55555555, "bank imports preserve decrypted code");

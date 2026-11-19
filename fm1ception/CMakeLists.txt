@@ -261,7 +261,7 @@ set(FM1C_DEFINITIONS
     JUCE_WEB_BROWSER=0
     JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0
-    FM1C_EMU_VERSION="3a0817f"
+    FM1C_EMU_VERSION="31d9ac0"
 )
 if(FM1C_NEEDS_CURL)
     # Opened when first used rather than linked, so one build runs on any distribution's

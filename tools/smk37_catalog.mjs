@@ -14,18 +14,21 @@ const text = (s) => s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&l
 // a card's origin: "new firmware · AUTHOR", or "<a ORIGINAL>based on BASE by AUTHOR</a> · ... <br>
 // SMK-37 port: <a PORT>owner/repo</a>" (or "X by AUTHOR ... <br>SMK-37 build: <a ..>")
 const cards = new Map();
-for (const m of page.matchAll(/<article class="card fw[^"]*" data-fw="([^"]+)"[^>]*>(.*?)<\/article>/gs)) {
+for (const m of page.matchAll(/<article class="card fw[^"]*"[^>]*? data-fw="([^"]+)"[^>]*>(.*?)<\/article>/gs)) {
   const body = m[2];
   const from = body.match(/<div class="from">(.*?)<\/div>/s)?.[1] || "";
   const [first, second = ""] = from.split(/<br\s*\/?>/);
   const orig = text(first.split(" · ")[0]);
   const by = orig.match(/^(?:new firmware|.*?\bby) (.+)$/)?.[1] || orig.replace(/^new firmware · /, "");
-  const port = second.match(/<a href="([^"]+)">([^<]+)<\/a>/);
+  // (only an "SMK-37 port:" / "SMK-37 build:" line names a port; another second line is a note)
+  const port = /SMK-37 (port|build)/.test(second) ? second.match(/<a href="([^"]+)">([^<]+)<\/a>/) : null;
+  // genkigenki's own: "GitHub: <a href=REPO>owner/repo</a>"
+  const own = first.match(/^GitHub: <a href="([^"]+)">([^<\/]+)\//);
   cards.set(m[1], {
-    repo: port?.[1] || body.match(/<h3><a href="([^"]+)"/)?.[1],
+    repo: port?.[1] || own?.[1] || body.match(/<h3><a href="([^"]+)"/)?.[1],
     upstream: first.match(/^<a href="([^"]+)">based on/)?.[1] || null,
     base: orig.match(/^based on (.+?) by /)?.[1] || null,
-    author: first.startsWith("new firmware") ? text(first).split("·").pop().trim() : by,
+    author: own ? own[2] : first.startsWith("new firmware") ? text(first).split("·").pop().trim() : by,
     porter: port ? port[2].split("/")[0] : null,
     about: text(body.match(/<p>(.*?)<\/p>/s)?.[1] || ""),
   });
@@ -37,13 +40,15 @@ const norm = (u) => (u || "").toLowerCase().replace(/\/$/, "").replace(/\/tree\/
 const firmwares = [{
   id: "stock", name: "M-VAVE stock firmware", version: "016", author: "M-VAVE", license: "M-VAVE's own", byo: true,
   about: "The firmware the SMK-37 Pro ships with: a MIDI controller. Its screen, buttons, pads and keys work (PATCH, " +
-    "then a chord: it names it), but no sound comes out here (its notes go to USB and Bluetooth MIDI, not emulated), " +
-    "and it runs at about 0.6x real time in the browser so far. This page does not host it and cannot download it: " +
+    "then a chord: it names it), and with PATCH on the keys play its DX7 synth (this emulator's own small bank: the " +
+    "factory patches are not in the package; its notes also go to USB and Bluetooth MIDI, not emulated). It runs at " +
+    "about 0.6x real time in the browser so far. This page does not host it and cannot download it: " +
     "download SMK-37 Pro_016.fwsc from M-VAVE, then open it here.",
   download: "https://yms-file-store.oss-cn-hongkong.aliyuncs.com/software/firmware/SMK-37Pro/SMK-37%20Pro_016.fwsc",
   repo: "https://github.com/genkigenki/fm1-to-smk37",
 }];
-for (const f of fwList) {
+// (the page lists FM-1 builds too, "fm1-*" with only an `fm1` package: those are not the SMK-37's)
+for (const f of fwList.filter((f) => f.v?.pro?.pkg)) {
   const c = cards.get(f.id) || {};
   const twin = c.upstream && fm1.find((g) => norm(g.repo) === norm(c.upstream));
   firmwares.push({

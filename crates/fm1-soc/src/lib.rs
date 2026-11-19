@@ -46,7 +46,7 @@ pub mod usb;
 pub use lcd::{write_bmp, Lcd};
 pub use periph::{Action, Periph, CPU_HZ, VEC_BASE};
 pub use ram::Ram;
-pub use spiflash::{SpiFlash, FLASH_SIZE};
+pub use spiflash::{FlashPart, SpiFlash, FLASH_SIZE};
 
 pub const XIP_BASE: u32 = 0x0200_0000;
 pub const RAM_BASE: u32 = 0x01c0_0000;
@@ -92,6 +92,9 @@ enum Region {
     /// SFCENC: the SFC's decryption and its plain window.
     Sfcenc,
     Dbg,
+    /// The CPU's guards (0x1EEE250..0x1EEE3FF: write limits, DBG_EN, PC limits): stored, and the PC
+    /// limits watched (`Soc::pc_windows`)
+    Guard,
     Irqc,
     /// Interrupt controller enable/priority words and software latch.
     Irqc2,
@@ -111,6 +114,56 @@ enum Region {
 // its end, and OberVave, ZP-12 and FM1-DOOM touch P33 tens of millions of times a second (a
 // watchdog kick per round of their main loop; a quarter of FM1-DOOM's time was the chain).
 const SFR_LO: u32 = 0x10000;
+/// The FM-1's flash cache as harbor's cache probe measured it on a real FM-1 (2026-10-24,
+/// probes/cache.c): 32 KB (a 32 KB footprint hits, 64 KB misses), 64-byte lines (the cost doubles
+/// with the stride up to 64), ~300 cycles a miss (1.29 us a load at a 64-byte stride). 4-way with LRU
+/// is assumed (not measured). Shared by data reads from XIP and code fetched from XIP. Its costs
+/// are in the strict clock's eighths of a cycle.
+#[derive(Clone)]
+pub struct XipCache {
+    tags: [[u32; 4]; 128],
+    age: [[u8; 4]; 128],
+    pub misses: u64,
+}
+
+impl Default for XipCache {
+    fn default() -> Self {
+        XipCache { tags: [[u32::MAX; 4]; 128], age: [[0, 1, 2, 3]; 128], misses: 0 }
+    }
+}
+
+impl XipCache {
+    /// a miss, in the strict clock's ticks (eighths of a 240 MHz cycle): ~300 cycles
+    pub const MISS_TICKS: u64 = 300 * 8;
+
+    /// The line of addr is used: true when it was not in the cache (it is now, in the way least
+    /// recently used)
+    #[inline]
+    pub fn access(&mut self, addr: u32) -> bool {
+        let line = addr >> 6;
+        let set = (line & 127) as usize;
+        let (tags, age) = (&mut self.tags[set], &mut self.age[set]);
+        let (way, miss) = match tags.iter().position(|&t| t == line) {
+            Some(w) => (w, false),
+            None => (age.iter().position(|&a| a == 3).unwrap_or(0), true),
+        };
+        if miss {
+            tags[way] = line;
+            self.misses += 1;
+        }
+        let was = age[way];
+        for a in age.iter_mut() {
+            if *a < was {
+                *a += 1;
+            }
+        }
+        age[way] = 0;
+        miss
+    }
+}
+
+/// Below this nothing answers: an access is bus-invalid (the guards' "NULL page")
+const NULL_PAGE: u32 = 0x1000;
 const SFR_HI: u32 = 0x14000;
 
 /// The region of an address in the peripheral window (8-byte cells: every block there starts
@@ -153,6 +206,10 @@ pub struct AddrHasher(u64);
 
 /// SFR words at aligned addresses below this live in `Soc::sfr_lo`.
 const SFR_LO_END: u32 = 0x6_0000;
+/// PLL0's two control words (JL_ANA), and what they read once a bootloader started it.
+const PLL0_CON0: u32 = 0x119a0;
+const PLL0_CON1: u32 = 0x119a4;
+const PLL0_BOOT: (u32, u32) = (0x4540_0203, 0x3f50_3026);
 
 impl std::hash::Hasher for AddrHasher {
     fn finish(&self) -> u64 {
@@ -166,6 +223,14 @@ impl std::hash::Hasher for AddrHasher {
     fn write_u32(&mut self, v: u32) {
         self.0 = (v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
+}
+
+/// What a core spins on (`Soc::waits`): the cores' hardware lock, or a byte lock at this address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "state", derive(serde::Serialize, serde::Deserialize))]
+pub enum Wait {
+    Lock,
+    Byte(u32),
 }
 
 /// The board around the chip: the FM-1's panel, or the SMK-37's (SMK-37 Pro / Elite, MKE-P37
@@ -195,6 +260,8 @@ impl Board {
 #[cfg_attr(feature = "state", derive(serde::Serialize, serde::Deserialize))]
 pub struct Soc {
     pub board: Board,
+    /// The FM-1's flash part (its JEDEC id; `set_flash_part`): the stock Puya unless asked.
+    pub flash_part: spiflash::FlashPart,
     /// The BT baseband's window base (0x2FC44), as the firmware set it.
     bt_window: u32,
     #[cfg_attr(feature = "state", serde(skip))]
@@ -207,6 +274,38 @@ pub struct Soc {
     /// Console bytes written through DBG_MSG / UART-style debug boxes.
     #[cfg_attr(feature = "state", serde(skip))]
     pub console: Vec<u8>,
+    /// The guards' causes in DBG_MSG (bit 12 a PC outside its limits, 4 / 5 a read / write of
+    /// unmapped space): set as a guard trips, cleared by DBG_MSG_CLR
+    pub dbg_cause: u32,
+    /// The PC limits were written: `machine::run_blocks` gives the core `pc_windows` again
+    pub pc_guard_dirty: bool,
+    /// EMU_MSG's causes (0x1EEF0D4, write 1 to clear): bit 0 a misaligned access (`strict_align`)
+    pub emu_cause: u32,
+    /// The FM-1's LCD transfers take their time on the wire, as the SMK-37's (SPI1 at 60 MHz /
+    /// (BAUD + 1): Felucca's and Dinghy's BAUD 4 is 12 MHz, a whole 240 x 240 frame ~77 ms). A
+    /// firmware that waits for whole frames then gets that little done in between, as on an FM-1
+    /// (FM-1 SID 2026-10-24: its tunes went silent on the device and played here, the transfers
+    /// having finished at once). Off (the default): the FM-1's transfers finish at once, unless
+    /// their interrupt is on. Set by the front end before the run (`lcd_timed_from_env`: fm1-live's
+    /// and fm1-emu's FM1_STRICT / FM1_LCD_TIMED; fm1-web's `fm1_lcd_timed`).
+    pub lcd_timed: bool,
+    /// A 16- or 32-bit RAM access that is not aligned raises the CPU exception (EMU_MSG bit 0), as
+    /// on an FM-1 (a probe, 2026-10-24: every misaligned load or store to RAM faulted; XIP reads
+    /// across). Only where loads and stores go through the bus: fm1-live's FM1_STRICT=1 runs
+    /// without the JIT for it.
+    pub strict_align: bool,
+    /// The flash cache (FM1_STRICT): XIP reads and code fetched from XIP that miss it cost a line's
+    /// fill (`XipCache`)
+    #[cfg_attr(feature = "state", serde(skip))]
+    pub xip_cache: Option<XipCache>,
+    /// Core 1 is running: a flash cache miss stalls core 1, not the clock; its ticks gather in
+    /// `core1_ticks` for `machine::Core1Bus` to take from core 1's budget, and what an instruction
+    /// ran past a slice's end is `core1_debt`, owed from the next slice
+    pub core1_charging: bool,
+    pub core1_ticks: u64,
+    pub core1_debt: u64,
+    /// FM1_TPROF: flash cache misses by (core << 32 | line address)
+    pub miss_hist: Option<Box<std::collections::HashMap<u64, u64>>>,
     /// Overlay RAM (second bank, 0x04000000), written by the app CRT.
     #[cfg_attr(feature = "state", serde(skip))]
     pub ovl: Ram,
@@ -247,6 +346,22 @@ pub struct Soc {
     /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
     /// pause, not a release, and a later 0 -> 1 of 0x10008 bit 3 latches nothing (core 1 runs on).
     cpu1_released_once: bool,
+    /// core 1 ran `idle`: it sleeps until an interrupt from its own bank is pending, as the
+    /// chip's core does (`machine::run_cpu1` leaves it be meanwhile; before this its `idle`
+    /// did nothing, and a core 1 that idles and feeds the watchdog each round, Bubba
+    /// Machine's, cost as much as a busy one).
+    pub cpu1_idle: bool,
+    /// A fault on core 1 (an instruction it could not run: a jump into erased flash, COSMOS
+    /// 0.23's package has its core 1 entry in a hole of 0xFF) stops that core alone and cpu0
+    /// goes on, as the chip's would (felucca-bsp's `cpu2_fallback` is built for a core 1 that
+    /// fails). Off, the default, the machine halts there as before: `run_cpu1`'s errors are
+    /// mostly the emulator's own gaps (Decode, Unsupported, MissingSlot), which a halt shows
+    /// and a surviving core 0 would hide. `--cpu1-survives` in the runners, `fm1_cpu1_survives`
+    /// for a page.
+    pub cpu1_survives: bool,
+    /// core 1 stopped on a fault (`cpu1_survives`): held until a chip reset; the message says
+    /// where.
+    pub cpu1_fault: Option<String>,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     #[cfg_attr(feature = "state", serde(skip))]
     audio_trace: bool,
@@ -256,6 +371,15 @@ pub struct Soc {
     rand: u64,
     /// The cores' hardware lock (`lockset` / `lockclr`): which core holds it.
     lock_owner: Option<u32>,
+    /// core 1 runs beside cpu0 (`machine::run_dual`): a core that finds a lock held then waits
+    /// for the other (`waits`), which the runner hands the machine to. Not set by a runner
+    /// that steps the cores itself (fm1-emu's), nor while cpu0 runs alone.
+    pub cpu1_running: bool,
+    /// What each core spins on, with `cpu1_running`: the hardware lock the other core holds
+    /// (`lockset` denied) or a byte lock it found taken (`testset`). Set by the instruction,
+    /// taken by the runner that acts on it (`machine::run_dual`, `run_cpu1`): the core's next
+    /// try sets it again or not.
+    pub waits: [Option<Wait>; 2],
     /// FM1_GPIO_TRACE: GPIO register writes by address (debugging port use).
     #[cfg_attr(feature = "state", serde(skip))]
     pub gpio_writes: Option<std::collections::BTreeMap<u32, u64>>,
@@ -400,8 +524,9 @@ impl Soc {
 
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
-        Self {
+        let mut soc = Self {
             board: Board::Fm1,
+            flash_part: spiflash::FlashPart::P25q80,
             bt_window: BT_WINDOW_BASE,
             xip,
             ram: Ram::new(ram_size),
@@ -410,16 +535,31 @@ impl Soc {
             lcd: Lcd::new(),
             flash: SpiFlash::new(),
             console: Vec::new(),
+            dbg_cause: 0,
+            pc_guard_dirty: false,
+            emu_cause: 0,
+            lcd_timed: false,
+            strict_align: false,
+            xip_cache: None,
+            core1_charging: false,
+            core1_ticks: 0,
+            core1_debt: 0,
+            miss_hist: None,
             ticks: 0,
             periph: Periph::default(),
             sfr_lo: vec![0; (SFR_LO_END / 4) as usize],
             sfr: Default::default(),
             paused: [false; 2],
             lock_owner: None,
+            cpu1_running: false,
+            waits: [None; 2],
             crc: 0,
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
             cpu1_released_once: false,
+            cpu1_idle: false,
+            cpu1_survives: false,
+            cpu1_fault: None,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
             xip_flash: true,
             sfc_key: None,
@@ -439,7 +579,14 @@ impl Soc {
             resets: 0,
             reset_req: None,
             boot: None,
-        }
+        };
+        // PLL0 as the bootloader leaves it, M-VAVE's and m-bootloader's alike (read off FM-1s:
+        // felucca-bsp chip/fm1_clock.h). The BSP's audio driver (AMB-1 1.3.2, CTL-1 1.0.3,
+        // CHOPPAH 0.99, Polly 0.6.2) checks these before it starts ALNK0 and leaves the audio
+        // off under any other clock. `take_boot` keeps them for a reset.
+        soc.sfr_set(PLL0_CON0, PLL0_BOOT.0);
+        soc.sfr_set(PLL0_CON1, PLL0_BOOT.1);
+        soc
     }
 
     /// cpu0 starts (the runners call this before its first instruction): the chip as it is now
@@ -489,8 +636,17 @@ impl Soc {
         }
         self.usb.keep_recording(&mut old); // (a computer's recording goes on across the reset)
         (self.paused, self.lock_owner, self.cpu1_release, self.cpu1_released_once, self.crc) = ([false; 2], None, false, false, 0);
+        (self.cpu1_idle, self.cpu1_fault) = (false, None);
+        (self.cpu1_running, self.waits) = (false, [None; 2]);
         self.flash.chip_reset();
         cpu.set_plain_state(&boot.cpu);
+        // the guards as at power-on: no causes, no PC limits (the restored SFRs hold none; the
+        // runner gives the core `pc_windows` again before its next block)
+        (self.dbg_cause, self.emu_cause) = (0, 0);
+        (cpu.pc_win, cpu.pc_trip) = (None, false);
+        self.pc_guard_dirty = true;
+        // (core 1 is dropped: nothing it owes or stalled on carries over)
+        (self.core1_charging, self.core1_ticks, self.core1_debt) = (false, 0, 0);
         self.sfr_lo.clone_from(&boot.sfr_lo);
         self.sfr = boot.sfr.clone();
         (self.sfc_con, self.sfc_unenc, self.bt_window) = (boot.sfc.0, boot.sfc.1, boot.bt_window);
@@ -543,15 +699,17 @@ impl Soc {
         match self.region(addr) {
             Region::Xip | Region::XipFlash | Region::Ram | Region::Ovl | Region::Sram2 => true,
             Region::Usb => self.usb.pure(addr),
-            Region::Irqc | Region::Iomap | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
+            Region::Irqc | Region::Iomap | Region::Clk | Region::Ana | Region::Bt | Region::Dbg | Region::Guard => true,
             Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 | Region::Sfcenc => true,
             // the tick counter's word counts the clock
             Region::Irqc2 => addr != 0x1eef0f0,
             // the timers' control and period words; the counters count the clock, and other
             // words tick `Soc::ticks`
             Region::Timer => matches!(addr, 0x10800 | 0x10900 | 0x10908) || matches!(addr & !0x300, 0x10400 | 0x10408),
-            // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too
-            Region::Gpio | Region::Adc | Region::Spi1 => fm1,
+            // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too (SPI1
+            // busy on the FM-1 too with `lcd_timed`)
+            Region::Gpio | Region::Adc => fm1,
+            Region::Spi1 => fm1 && !self.lcd_timed,
             // (the FFT / vector unit's done bit comes with the clock)
             Region::Spi0 | Region::Rand | Region::HwDsp | Region::HwEq | Region::HwSrc | Region::Unknown => false,
         }
@@ -592,13 +750,18 @@ impl Soc {
         }
     }
 
-    /// Wire the chip into `board`'s panel (and its flash chip's id).
+    /// Wire the chip into `board`'s panel (and its flash chip's id: the SMK-37 Pro's own part,
+    /// the FM-1's `flash_part`).
     pub fn set_board(&mut self, board: Board) {
         self.board = board;
         self.periph.board = board;
-        if board == Board::Smk37 {
-            self.flash.jedec = [0xeb, 0x60, 0x14];
-        }
+        self.flash.jedec = if board == Board::Smk37 { [0xeb, 0x60, 0x14] } else { self.flash_part.jedec() };
+    }
+
+    /// Which part the FM-1's flash is (the SMK-37 Pro keeps its own): before or after the boot.
+    pub fn set_flash_part(&mut self, part: spiflash::FlashPart) {
+        self.flash_part = part;
+        self.set_board(self.board);
     }
 
     /// All unknown accesses so far — the peripheral bring-up TODO list.
@@ -617,6 +780,7 @@ impl Soc {
             let pullup = self.sfr_get(usb::USB_IO_CON0) & 0x40 != 0;
             let mut u = std::mem::take(&mut self.usb);
             u.frame(self, pullup);
+            self.periph.set_usb_irqs(u.irq_lines());
             self.usb = u;
         }
         if let Some((adr, words)) = due.audio_half {
@@ -653,6 +817,23 @@ impl Soc {
     /// The highest-priority interrupt pending for core `core` (its own enable bank).
     pub fn pending_irq_for(&self, core: u32) -> Option<(u8, u8)> {
         self.periph.pending_irq_for(core)
+    }
+
+    /// Would `core` still spin on `w` (`waits`): the hardware lock held by the other core, the
+    /// byte lock not yet cleared (one outside the RAMs, which no `testset` should see: never
+    /// cleared, so the core waits the slice out rather than retrying it a round at a time)?
+    pub fn still_waits(&self, core: u32, w: Wait) -> bool {
+        match w {
+            Wait::Lock => self.lock_owner.is_some_and(|c| c != core),
+            Wait::Byte(a) => !matches!(self.ram_byte(a), Some(0)),
+        }
+    }
+
+    /// The byte at `a` in one of the RAMs (None: not in one).
+    fn ram_byte(&self, a: u32) -> Option<u8> {
+        [(&self.ram, RAM_BASE), (&self.ovl, OVL_BASE), (&self.sram2, SRAM2_BASE)]
+            .into_iter()
+            .find_map(|(r, base)| a.checked_sub(base).filter(|&o| (o as usize) < r.len()).map(|o| r.read8(o)))
     }
 
     pub fn unknown_accesses(&self) -> &[UnknownAccess] {
@@ -712,8 +893,80 @@ impl Soc {
             0x1eef000..=0x1eef3ff => Region::Irqc2,
             0x1eee240..=0x1eee24f => Region::Dbg,
             hwdsp::BASE..=hwdsp::END => Region::HwDsp,
+            0x1eee250..=0x1eee3ff => Region::Guard,
             _ => Region::Unknown,
         }
+    }
+
+    /// FM1_TPROF: a flash cache miss counted by core and line
+    #[cold]
+    fn miss_note(&mut self, addr: u32) {
+        let core = self.core1_charging as u64;
+        if let Some(h) = self.miss_hist.as_mut() {
+            *h.entry(core << 32 | (addr & !63) as u64).or_insert(0) += 1;
+        }
+    }
+
+    /// A flash cache miss's ticks: core 1's own time while it runs, else the clock's
+    #[inline(always)]
+    fn xip_charge(&mut self, t: u64) {
+        if self.core1_charging {
+            self.core1_ticks += t;
+        } else {
+            self.periph.cycles += t;
+        }
+    }
+
+    /// The CPU's guards (as Felucca's and Dinghy's hal/fm1_guard.h arm them). A guard that trips
+    /// sets its cause in DBG_MSG and raises the CPU exception, interrupt 1 (fm1_irq.h's fault
+    /// report reads both); fm1-emu did not have them, so code that trips one on an FM-1 (a probe
+    /// run from RAM outside the PC limits, 2026-10-24) ran on here.
+    pub fn guard_trip(&mut self, bit: u32) {
+        self.dbg_cause |= 1 << bit;
+        self.raise_exception();
+    }
+
+    /// The CPU exception (interrupt 1) is raised: pending until cpu0 takes it, when the firmware
+    /// has it enabled (as Felucca's, Dinghy's and fm1-dock's fm1_irq.h do). Not enabled, it is
+    /// dropped (the cause stays in DBG_MSG / EMU_MSG): pending for good, it would keep the run
+    /// from skipping a loop or an idle stretch ever again.
+    fn raise_exception(&mut self) {
+        if self.periph.irq_enabled(0, 1) {
+            self.periph.exc_pending = true;
+            self.periph.next_due = 0;
+        }
+    }
+
+    /// The HW DSP / EQ / SRC units' clock: CPU cycles (their jobs' costs are), the clock's ticks
+    /// over `Periph::cycle_ticks`
+    #[inline]
+    fn unit_clock(&self) -> u64 {
+        self.periph.cycles / self.periph.cycle_ticks.max(1)
+    }
+
+    /// A misaligned 16- / 32-bit RAM access (`strict_align`): EMU_MSG bit 0 and the exception
+    #[cold]
+    fn misaligned(&mut self, addr: u32, size: u32) {
+        if std::env::var_os("FM1_STRICT_LOG").is_some() {
+            eprintln!("misaligned {size}-byte access at {addr:#010x}");
+        }
+        self.emu_cause |= 1;
+        self.raise_exception();
+    }
+
+    /// A bus-invalid access (DBG_EN's bits 4 / 5: AXI read / write): a guard trip once armed
+    fn bus_invalid(&mut self, bit: u32) {
+        if self.sfr_get(0x1eee340) & (1 << bit) != 0 {
+            self.guard_trip(bit);
+        }
+    }
+
+    /// The PC limits (0x1EEE380 / 84: window 0 high / low, 88 / 8C: window 1): code may run inside
+    /// either window and an instruction fetched outside both raises the exception (DBG_MSG bit
+    /// 12). None until a firmware sets them.
+    pub fn pc_windows(&mut self) -> Option<[(u32, u32); 2]> {
+        let w = [(self.sfr_get(0x1eee384), self.sfr_get(0x1eee380)), (self.sfr_get(0x1eee38c), self.sfr_get(0x1eee388))];
+        (w[0].1 != 0 || w[1].1 != 0).then_some(w)
     }
 
     fn sfr_get(&mut self, addr: u32) -> u32 {
@@ -823,16 +1076,15 @@ impl Soc {
         self.periph.spi2_start(bytes, baud, con & 0x2000 != 0);
     }
 
-    /// A SPI1 transfer finished: with CON bit 13 (interrupt enable) that is IRQ 16, the stock
-    /// LCD driver's DMA-done (its layer flush waits for the handler). The interrupt comes after
-    /// the bytes' time on the wire (`Periph::spi1_start`): FM-1 V16's driver enables it, starts
-    /// the DMA and only then marks the DMA as running, so an interrupt at the start found its
-    /// handler idle, which returned without clearing it, again and again. On the FM-1 the
-    /// transfer-done bit still reads as set at once (polls finish); the SMK-37's is busy until the
-    /// bytes have gone out.
+    /// A SPI1 transfer started: it takes the bytes' time on the wire (`Periph::spi1_start`): on the
+    /// SMK-37, on the FM-1 with `lcd_timed` (else done at once there), and whenever CON bit 13
+    /// (interrupt enable) is set, since its end is IRQ 16, the stock LCD driver's DMA-done (its
+    /// layer flush waits for the handler). FM-1 V16's driver enables it, starts the DMA and only
+    /// then marks the DMA as running, so an interrupt at the start found its handler idle, which
+    /// returned without clearing it, again and again.
     fn spi1_done(&mut self, bytes: u32) {
         let irq = self.sfr_get(0x11d00) & 0x2000 != 0;
-        if self.board == Board::Smk37 || irq {
+        if self.board == Board::Smk37 || irq || self.lcd_timed {
             let baud = self.sfr_get(0x11d04);
             self.periph.spi1_start(bytes, baud, irq);
         }
@@ -850,6 +1102,16 @@ impl Soc {
     }
 }
 
+/// `Soc::lcd_timed` as the native front ends (fm1-live, fm1-emu) take it from the environment: the
+/// timed LCD is part of the realistic mode, on with FM1_STRICT=1 or FM1_LCD_TIMED=1, and
+/// FM1_LCD_INSTANT=1 turns it off again (also under FM1_STRICT). Off by default, so the default
+/// emulator's timing (and the catalog's recorded audio) stays as it was.
+pub fn lcd_timed_from_env() -> bool {
+    // (set at all is on, as the emulator's other switches)
+    let on = |k: &str| std::env::var_os(k).is_some();
+    (on("FM1_STRICT") || on("FM1_LCD_TIMED")) && !on("FM1_LCD_INSTANT")
+}
+
 impl Bus for Soc {
     fn irq_window(&mut self) {
         if self.periph.any_pending() {
@@ -863,12 +1125,25 @@ impl Bus for Soc {
     fn idle(&mut self, core: u32) {
         if core == 0 {
             self.periph.idle();
+        } else {
+            self.cpu1_idle = true; // (a runner stepping core 1 against the SoC: fm1-emu's)
+        }
+    }
+
+    fn spin(&mut self, core: u32, addr: u32) {
+        if self.cpu1_running {
+            self.waits[core as usize & 1] = Some(Wait::Byte(addr));
         }
     }
 
     fn hw_lock(&mut self, core: u32, set: bool) -> bool {
         match (set, self.lock_owner) {
-            (true, Some(c)) if c != core => false,
+            (true, Some(c)) if c != core => {
+                if self.cpu1_running {
+                    self.waits[core as usize & 1] = Some(Wait::Lock);
+                }
+                false
+            }
             (true, _) => {
                 self.lock_owner = Some(core);
                 true
@@ -933,6 +1208,9 @@ impl Bus for Soc {
 
     #[inline(always)]
     fn read16(&mut self, addr: u32) -> u16 {
+        if addr & 1 != 0 && self.strict_align && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
+            self.misaligned(addr, 2);
+        }
         // halfwords sit at offsets 0 and 2 of the word (the old `>> 8` for
         // offset 2 returned bytes 1-2 and sheared every 16-bit pixel canvas)
         let v = self.read32(addr & !3);
@@ -943,13 +1221,45 @@ impl Bus for Soc {
     fn read32(&mut self, addr: u32) -> u32 {
         let o = addr.wrapping_sub(RAM_BASE) as usize;
         if o + 4 <= self.ram.len() {
+            if addr & 3 != 0 && self.strict_align {
+                self.misaligned(addr, 4);
+            }
             return self.ram.read32(o as u32);
         }
         let x = addr.wrapping_sub(XIP_BASE) as usize;
         if x + 4 <= self.xip.len() {
+            if let Some(c) = self.xip_cache.as_mut() {
+                if c.access(addr) {
+                    self.xip_charge(XipCache::MISS_TICKS);
+                    self.miss_note(addr);
+                }
+            }
             return u32::from_le_bytes([self.xip[x], self.xip[x + 1], self.xip[x + 2], self.xip[x + 3]]);
         }
         self.read32_slow(addr)
+    }
+
+    #[inline(always)]
+    fn fetch_cost(&mut self, pc: u32) {
+        if pc.wrapping_sub(XIP_BASE) < 0x0100_0000 {
+            if let Some(c) = self.xip_cache.as_mut() {
+                let (m1, m2) = (c.access(pc), c.access(pc.wrapping_add(4)));   /* (a 6-byte one may cross a line) */
+                let miss = m1 as u64 + m2 as u64;
+                self.xip_charge(miss * XipCache::MISS_TICKS);
+                if m1 { self.miss_note(pc); }
+                if m2 { self.miss_note(pc.wrapping_add(4)); }
+            }
+        }
+    }
+
+    /// An instruction fetch: never a misaligned access (`strict_align`), code is halfword-aligned
+    #[inline(always)]
+    fn fetch32(&mut self, addr: u32) -> u32 {
+        let o = addr.wrapping_sub(RAM_BASE) as usize;
+        if o + 4 <= self.ram.len() {
+            return self.ram.read32(o as u32);
+        }
+        self.read32(addr)
     }
 
     #[inline(always)]
@@ -963,6 +1273,9 @@ impl Bus for Soc {
 
     #[inline(always)]
     fn write16(&mut self, addr: u32, value: u16) {
+        if addr & 1 != 0 && self.strict_align && (addr.wrapping_sub(RAM_BASE) as usize) < self.ram.len() {
+            self.misaligned(addr, 2);
+        }
         // merged at (addr & 2) within the aligned word, as the slow path does
         let o = (addr & !1).wrapping_sub(RAM_BASE) as usize;
         if o + 2 <= self.ram.len() && addr & 1 == 0 {
@@ -975,6 +1288,9 @@ impl Bus for Soc {
     fn write32(&mut self, addr: u32, value: u32) {
         let o = addr.wrapping_sub(RAM_BASE) as usize;
         if o + 4 <= self.ram.len() {
+            if addr & 3 != 0 && self.strict_align {
+                self.misaligned(addr, 4);
+            }
             return self.ram.write32(o as u32, value);
         }
         self.write32_slow(addr, value)
@@ -1035,6 +1351,8 @@ impl Soc {
             Region::Bt => {
                 if addr == 0x2fc44 { self.bt_window } else { 0 }
             }
+            // EMU_MSG: its causes only (what was written is not kept)
+            Region::Irqc2 if addr == 0x1eef0d4 => self.emu_cause,
             Region::Gpio | Region::Adc | Region::Alnk | Region::Irqc2 | Region::Uart1 => {
                 match self.periph.read(addr) {
                     Some(v) => v,
@@ -1052,9 +1370,9 @@ impl Soc {
             Region::Spi2 => self.sfr_get(addr) | if addr == 0x11e00 { 0x8000 } else { 0 },
             Region::Spi1 => {
                 if addr == 0x11d00 {
-                    // CON: transfer-done (the FM-1: always, so polls finish; the SMK-37: once the
-                    // bytes have gone out)
-                    let busy = self.board == Board::Smk37 && self.periph.cycles < self.periph.spi1_done_at;
+                    // CON: transfer-done, once the bytes have gone out (the FM-1 without `lcd_timed`:
+                    // always, so polls finish)
+                    let busy = (self.board == Board::Smk37 || self.lcd_timed) && self.periph.cycles < self.periph.spi1_done_at;
                     self.sfr_get(addr) | if busy { 0 } else { 0x8000 }
                 } else if addr == 0x11d10 {
                     self.sfr_get(addr)
@@ -1062,7 +1380,10 @@ impl Soc {
                     self.sfr_get(addr)
                 }
             }
-            Region::Dbg => self.sfr_get(addr),
+            // DBG_MSG: the causes of the guards that tripped (`guard_trip`); a word written there
+            // goes to the console (the emulator's own channel) and is not read back
+            Region::Dbg => if addr == 0x1eee244 { self.dbg_cause } else { self.sfr_get(addr) },
+            Region::Guard => self.sfr_get(addr),
             Region::Crc => if addr == 0x13504 { self.crc as u32 } else { 0 },
             // JL_RAND (0x13B00 R64L, 0x13B04 R64H): a new number at every read, from a fixed
             // seed so runs repeat. Read as 0 it hung the stock firmware ~8 s after boot: a
@@ -1077,10 +1398,13 @@ impl Soc {
                 (if addr == 0x13b00 { x } else { x >> 32 }) as u32
             }
             Region::P33 => self.p33.read(addr),
-            Region::HwDsp => self.hwdsp.read(addr, self.periph.cycles),
-            Region::HwEq => self.hweq.read(addr, self.periph.cycles),
-            Region::HwSrc => self.hwsrc.read(addr, self.periph.cycles),
+            Region::HwDsp => self.hwdsp.read(addr, self.unit_clock()),
+            Region::HwEq => self.hweq.read(addr, self.unit_clock()),
+            Region::HwSrc => self.hwsrc.read(addr, self.unit_clock()),
             Region::Unknown => {
+                if addr < NULL_PAGE {
+                    self.bus_invalid(4); // a read of the NULL page (DBG_MSG bit 4, AXI read)
+                }
                 self.log_unknown(addr, 4, false, 0);
                 0
             }
@@ -1149,6 +1473,13 @@ impl Soc {
                 self.sfr_set(addr, value)
             }
             Region::Alnk | Region::Irqc2 => {
+                if addr == 0x1eef0d4 {
+                    // EMU_MSG: a write clears the causes it has 1s for and is not kept (Felucca's,
+                    // Dinghy's and fm1-dock's fm1_irq.h write all ones at init: kept, every later
+                    // read would show every cause)
+                    self.emu_cause &= !value;
+                    return;
+                }
                 if !self.periph.write(addr, value) {
                     self.sfr_set(addr, value);
                 }
@@ -1178,7 +1509,10 @@ impl Soc {
                 }
                 self.sfr_set(addr, value)
             }
-            Region::Usb if (usb::USB_LO..=usb::USB_HI).contains(&addr) => self.usb.write(addr, value, self.periph.cycles),
+            Region::Usb if (usb::USB_LO..=usb::USB_HI).contains(&addr) => {
+                self.usb.write(addr, value, self.periph.cycles);
+                self.periph.set_usb_irqs(self.usb.irq_lines());
+            }
             Region::Usb => {
                 if addr == 0x16a0c && self.board == Board::Smk37 {
                     self.periph.smk.commons = value;
@@ -1222,7 +1556,17 @@ impl Soc {
                     "msg" => {
                         self.console.extend_from_slice(&value.to_le_bytes());
                     }
+                    "msg_clr" => self.dbg_cause &= !value,
                     _ => {}
+                }
+                self.sfr_set(addr, value);
+            }
+            Region::Guard => {
+                if (0x1eee380..=0x1eee38f).contains(&addr) {
+                    // (the runner hands the core its new windows before the next block: the run
+                    // stops at once, as for an event due now)
+                    self.pc_guard_dirty = true;
+                    self.periph.next_due = 0;
                 }
                 self.sfr_set(addr, value);
             }
@@ -1239,23 +1583,28 @@ impl Soc {
             Region::HwDsp => {
                 // (the unit reads and writes RAM through the bus: taken out while it runs)
                 let mut u = std::mem::take(&mut self.hwdsp);
-                let cycles = self.periph.cycles;
+                let cycles = self.unit_clock();
                 u.write(self, addr, value, cycles);
                 self.hwdsp = u;
             }
             Region::HwEq => {
                 let mut u = std::mem::take(&mut self.hweq);
-                let cycles = self.periph.cycles;
+                let cycles = self.unit_clock();
                 u.write(self, addr, value, cycles);
                 self.hweq = u;
             }
             Region::HwSrc => {
                 let mut u = std::mem::take(&mut self.hwsrc);
-                let cycles = self.periph.cycles;
+                let cycles = self.unit_clock();
                 u.write(self, addr, value, cycles);
                 self.hwsrc = u;
             }
-            Region::Unknown => self.log_unknown(addr, 4, true, value),
+            Region::Unknown => {
+                if addr < NULL_PAGE {
+                    self.bus_invalid(5); // a write to the NULL page (DBG_MSG bit 5, AXI write)
+                }
+                self.log_unknown(addr, 4, true, value)
+            }
         }
     }
 }
@@ -1276,27 +1625,36 @@ pub struct Stock {
     /// The protected image's end in flash (`fwsc::Unpacked::end`): decrypted up to here as
     /// installed (`Soc::sfc_boot`).
     pub app_end: usize,
-    /// FM-1 user bank, if this package has one.
+    /// The USR area (the firmware's patch bank), if this package has one, and how its board's
+    /// stock firmware lays the bank out in it.
     pub usr: Option<usize>,
+    pub usr_layout: fwsc::UsrLayout,
 }
 
 pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, String> {
     let u = fwsc::unpack(pkg)?;
     let board = Board::of_identity(&u.identity);
     let mut flash = fwsc::full_flash(&u.raw, FLASH_SIZE);
+    // the app's resource region, which the update loader writes after the app (Polly 0.6.4's
+    // band styles, Melodee 1.6's factory sounds): without it the firmware boots, and does without
+    fwsc::lay_resources(&mut flash, &u.res);
     if board == Board::Smk37 {
         // a unit's factory calibration record, with the stock defaults
         fwsc::smk_trim_fill_defaults(&mut flash);
     }
-    if let Some(usr) = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1) {
-        fwsc::usr_fill_defaults(&mut flash, usr);
+    // the patch bank real units carry from the factory (the SMK-37 Pro's stock firmware loads
+    // its current patch from an erased area as it is, and plays nothing); any package with a USR
+    // entry gets it, community firmwares too (none tested reads that area)
+    let usr = fwsc::usr_offset(&u);
+    let usr_layout = fwsc::UsrLayout::of(board);
+    if let Some(usr) = usr {
+        fwsc::usr_fill_defaults(&mut flash, usr, usr_layout);
         if let Some(b) = syx {
-            fwsc::usr_load_syx(&mut flash, usr, b, 0)?;
+            fwsc::usr_load_syx(&mut flash, usr, usr_layout, b, 0)?;
         }
     }
     let app = u.entry("app.bin").map(|h| h.offset).unwrap_or(0x120);
-    let usr = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1);
-    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, key: u.key, app_end: u.end, usr })
+    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, key: u.key, app_end: u.end, usr, usr_layout })
 }
 
 /// Ready a Soc for a package's firmware: its board, its flash chip, and the SPL's boot
@@ -1371,6 +1729,7 @@ mod tests {
             0x1e000..=0x1e01f | 0x1e800..=0x1eb3f => Region::HwEq,
             0x14300..=0x14323 => Region::HwSrc,
             0x1eee240..=0x1eee24f => Region::Dbg,
+            0x1eee250..=0x1eee3ff => Region::Guard,
             _ => Region::Unknown,
         }
     }
@@ -1488,6 +1847,17 @@ mod tests {
         assert!(soc.flash.cut());
     }
 
+    #[test]
+    fn pll0_reads_as_the_bootloader_left_it() {
+        // felucca-bsp's audio driver: ALNK0 starts only under this clock (fm1_clock.h)
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        assert_eq!(soc.read32(0x119a0), 0x4540_0203);
+        assert_eq!(soc.read32(0x119a4) & 0x07ff_ffff, 0x0750_3026);
+        // still a plain register: what the firmware writes reads back
+        soc.write32(0x119a0, 0x4540_0200);
+        assert_eq!(soc.read32(0x119a0), 0x4540_0200);
+    }
+
     /// A chip with IRQ 16 enabled in cpu0's bank and SPI1 at the LCD's BAUD.
     fn spi1_soc(board: Board) -> Soc {
         let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
@@ -1529,6 +1899,86 @@ mod tests {
         soc.write32(0x11d00, 0xc021);
         soc.advance(1_000_000);
         assert_eq!(soc.periph.pending_irq(), None);
+    }
+
+    #[test]
+    fn usb_frame_and_bus_reset_interrupts_are_acknowledged_independently() {
+        const CON0: u32 = usb::USB_LO;
+        const CON1: u32 = CON0 + 4;
+        const ON: u32 = 0x0005;
+        const SOFIE: u32 = 1 << 10;
+        const SIEIE: u32 = 1 << 11;
+        const CLR_SOF_PND: u32 = 1 << 12;
+        const SOF_PND: u32 = 1 << 13;
+        const SIE_PND: u32 = 1 << 14;
+
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        for irq in [periph::IRQ_USB_SOF, periph::IRQ_USB_CTRL] {
+            soc.periph.icfg[(irq >> 3) as usize] |= 1 << ((irq & 7) * 4);
+        }
+        soc.usb_plug();
+        let frame = soc.periph.usb_period;
+        soc.write32(usb::USB_IO_CON0, 0x40);
+        soc.write32(CON0, ON | SOFIE);
+        soc.advance(frame);
+        assert_eq!(soc.pending_irq(), Some((periph::IRQ_USB_SOF, 0)));
+        soc.write32(CON0, ON | CLR_SOF_PND);
+        assert_eq!(soc.read32(CON0) & SOF_PND, 0);
+        assert_eq!(soc.pending_irq(), None);
+
+        for _ in 0..100 {
+            soc.advance(frame);
+        }
+        soc.write32(CON0, ON | SIEIE);
+        assert_eq!(soc.pending_irq(), None, "reset is masked in the SIE");
+        soc.write32(CON1, 0x0b04); // INTRUSBE: enable reset
+        assert_ne!(soc.read32(CON0) & SIE_PND, 0);
+        assert_eq!(soc.pending_irq(), Some((periph::IRQ_USB_CTRL, 0)));
+        soc.write32(CON1, 0x4600); // INTRUSB: read and acknowledge reset
+        assert_eq!(soc.pending_irq(), None);
+        assert_eq!(soc.read32(CON0) & SIE_PND, 0);
+        assert_ne!(soc.read32(CON0) & SOF_PND, 0);
+    }
+
+    #[test]
+    fn fm1_lcd_timing_is_the_socs_own() {
+        // `Soc::lcd_timed`, per machine (no process-wide switch): the FM-1's LCD DMA is busy for
+        // its time on the wire only with it; without, done at once (polls finish)
+        for timed in [false, true, false] {
+            let mut soc = spi1_soc(Board::Fm1);
+            soc.lcd_timed = timed;
+            soc.write32(0x11d00, 0x0021);
+            soc.write32(0x11d0c, RAM_BASE);
+            soc.write32(0x11d10, 0x800);
+            assert_eq!(soc.read32(0x11d00) & 0x8000 == 0, timed, "timed {timed}");
+            assert_eq!(soc.pure_read(0x11d00), !timed);
+            soc.advance(1_000_000);
+            assert_ne!(soc.read32(0x11d00) & 0x8000, 0, "done once the bytes are out");
+        }
+    }
+
+    #[test]
+    fn hw_unit_jobs_take_their_cycles_on_the_strict_clock() {
+        // FM1_STRICT's clock counts eighths of a cycle (`Periph::cycle_ticks`): a HW DSP job takes
+        // its cycles there too, 8 x the ticks
+        let done_after = |scale: u64| {
+            let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+            soc.periph.cycle_ticks = scale;
+            let d = RAM_BASE + 0x100;
+            soc.write32(d, (64 << 16) | 2); // a 64-point real FFT
+            soc.write32(d + 4, RAM_BASE + 0x1000);
+            soc.write32(d + 8, RAM_BASE + 0x2000);
+            soc.write32(0x1ee0404, d);
+            soc.write32(0x1ee0400, (1 << 8) | (1 << 6) | 1);
+            let t0 = soc.periph.cycles;
+            while soc.read32(0x1ee0400) & 0x80 == 0 {
+                soc.periph.cycles += 1;
+            }
+            soc.periph.cycles - t0
+        };
+        let (one, eight) = (done_after(1), done_after(8));
+        assert!(one > 1);
+        assert!((8 * one - 7..=8 * one).contains(&eight), "{one} cycles, {eight} ticks");
     }
 
     #[test]

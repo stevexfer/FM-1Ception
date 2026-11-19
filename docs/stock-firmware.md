@@ -24,6 +24,12 @@ The stock app needs more than its `app.bin`:
   carry the factory bank (Yamaha's ROM1A) there. A blank area gets the emulator's own small bank
   (`EMU E.PNO`, `EMU BASS`, … then `INIT VOICE`) with zeroed settings; erased settings (0xFF) leave
   only one voice sounding. `--syx` loads a DX7 32-voice bank into slots 1-32.
+  The SMK-37 Pro's firmware (and the mods built on it) keeps the same synth, with its USR area at
+  `0xF4000`–`0xFE000` laid out its own way (`fwsc::UsrLayout::SMK37`): 4 banks of 32 voices from
+  `+0`, a 163-byte record per patch from `+0x4000`, a 128-byte block at `+0x9180` and its 9-byte
+  state at `+0x9200`, which it writes itself. Left erased, it loads patch 0 as it is and plays
+  nothing (2026-10-31: three SMK-37 Pro mods silent in the bench); it gets the same bank. Its
+  keys play the synth only with **PATCH** on (the button's LED): a bench script presses PATCH first.
 
 Every community package boots the same way with byte-identical audio, so the page boots all
 firmwares from their whole package.
@@ -41,7 +47,7 @@ firmwares from their whole package.
 | two stacks | interrupts clobbered task stacks or tasks never switched | see below |
 | the protected image decrypted to its end (V16) | no screen, keys ignored: the synth engine's start returned early | the package is decrypted up to its `PRCT` entry's end, not the app area's: right after the area is the `EXT_RESERVED` directory (`USER` at flash 0xED000, 0x12000), found by walking from the area's head by its size; without it `mnt/sdfile/EXT_RESERVED/user` does not open and neither the engine nor the UI task starts |
 | FPU roundings, `rev16` (V16) | halts on `3f e5 0f 33`, then `70 f0 40 33` | `ftoi` / `ftou` / `ftof` with (even), (trunc), (ceil), (floor); `rev16`, `popcnt` (see isa-notes) |
-| SPI1's interrupt after the transfer (V16) | the UI froze under an interrupt storm | V16's LCD driver enables the interrupt, starts the DMA and then marks it running: an interrupt at the start found the handler idle, which returned without clearing it. It now comes after the bytes' time on the wire, as on the SMK-37 (the done bit still reads set at once). V15 plays the same audio; it idles less (its flush waits as on hardware) |
+| SPI1's interrupt after the transfer (V16) | the UI froze under an interrupt storm | V16's LCD driver enables the interrupt, starts the DMA and then marks it running: an interrupt at the start found the handler idle, which returned without clearing it. It now comes after the bytes' time on the wire, as on the SMK-37 (the done bit still reads set at once, unless the LCD is timed: `FM1_LCD_TIMED` / `FM1_STRICT`). V15 plays the same audio; it idles less (its flush waits as on hardware) |
 | SPI1's interrupt enable clears (V16) | ~0.1x real time from a held key or a swept knob on: the UI froze under an interrupt storm | CON kept every bit ever written, so the LCD driver could not turn IRQ 16 off (bit 13) before a transfer's interrupt was due; that interrupt found the handler idle, which returned without clearing it. CON now holds the last write (not bits 14 and 15), and bit 13 off drops IRQ 16, raised or still to come |
 
 ## The stack model (`Cpu::user`)
@@ -61,10 +67,28 @@ cpu1 starts when cpu0 sets `0x10008` bit 3 (latched at the write: X0X and Melode
 only briefly), at the word in `0x01C7FFF8`. It has no clock of its own: cpu0 runs in slices of
 1024 instructions, then cpu1 may run as many instructions as cycles passed (idle skips included),
 through `Core1Bus`, whose tick budget stops interpreted and compiled code alike. It stops early
-when it is back at the same pc with the same registers (a job loop with nothing to do). Compiled
+when it is back at the same pc with the same registers (a job loop with nothing to do). A core 1
+that runs `idle` sleeps until an interrupt from its own bank (`0x1EEF300`) is pending, as the
+chip's does (before, `idle` did nothing on core 1, and a core that idles and feeds the watchdog
+each round, Bubba Machine's, cost as much as a busy one). A fault on core 1 halts the machine,
+as any fault: most are the emulator's own gaps, which a halt shows. With `--cpu1-survives`
+(`Soc::cpu1_survives`; `fm1_cpu1_survives` for a page) core 1 stops alone and cpu0 goes on, as
+the chip's would, for a firmware whose core 1 fails on the chip too (COSMOS 0.23's package sends
+it into erased flash; felucca-bsp's `cpu2_fallback` is built for that); `fm1_cpu1_fault` says
+it happened. Compiled
 code is capped to a slice (`Periph::room_cap`): unbounded, a JIT loop waiting on cpu1 ran for up
-to 2^30 instructions before cpu1 ran at all. `fm1-live` and the browser build share this code;
-`fm1-emu` interleaves the cores instruction by instruction.
+to 2^30 instructions before cpu1 ran at all. A core that finds a lock held (`lockset` denied, a
+`testset` on a taken byte with `ifeq goto` back to it: `Soc::waits`) hands the machine over
+rather than spinning its slice out: cpu1 ends its run, cpu0 ends its slice and cpu1 runs on while
+it holds the lock, to its `lockclr` or within 64 instructions of the store that clears the byte
+(compiled code stores RAM without the bus, so the store itself cannot end the run), the clock
+moving for cpu0's retries (Bubba Machine's FreeRTOS SMP takes the hardware lock around every critical section: 3x
+faster with this). cpu0's interrupts wait up to a slice during a handover: nothing for the SDK's
+critical sections, which disable them, visible for a firmware that spins with them enabled. A
+`testset` taken once, with no loop back to it (a try-lock, a claim-a-job byte), records no wait.
+With a flaky core 1 (`--flaky-core1`) a misread `testset` records one too, so that mode's timing
+is not the one before the handover. `fm1-live` and the browser build share this code; `fm1-emu`
+interleaves the cores instruction by instruction.
 
 Users: the stock firmware (synth rendering on cpu1), X0X, Melodee 1.0.1, ChoralRoot. With two
 cores the JIT and the interpreter interleave them at slightly different points, so their audio is

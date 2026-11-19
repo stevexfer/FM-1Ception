@@ -7,15 +7,21 @@
 // The WebAssembly JIT's host side, as web/jit.js (a copy: an AudioWorklet does not import
 // modules everywhere): compile a hot block's module, install its `run` in the function table.
 function jitImports(exports, stats) {
+  let next;
   return {
-    fm1_jit_compile(ptr, len) {
+    fm1_jit_compile(ptr, len, hRead, hWrite, hOp) {
       const start = now();
       try {
         const x = exports();
         const bytes = new Uint8Array(x.memory.buffer, ptr, len).slice();
         const table = x.__indirect_function_table;
-        const run = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env: { memory: x.memory, table } }).exports.run;
-        const slot = table.grow(1);
+        // the helpers as function imports, from the table (a module importing the table itself
+        // gets a copy of it, grown and updated with every region: 40% of a two-core firmware's
+        // time); the table grows by a chunk, the emulator's own instance being its only user
+        const env = { memory: x.memory, h_read: table.get(hRead), h_write: table.get(hWrite), h_op: table.get(hOp) };
+        const run = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env }).exports.run;
+        if (next === undefined || next >= table.length) { next = table.length; table.grow(256); }
+        const slot = next++;
         table.set(slot, run);
         stats.regions++;
         stats.bytes += len;
@@ -176,6 +182,7 @@ class Fm1 extends AudioWorkletProcessor {
     if (token !== this.bootToken) return;
     // hot code compiled to WebAssembly, a few blocks per quantum at most (?jit=0: interpreter only)
     x.fm1_jit(m.jit === false ? 0 : 1, 16);
+    x.fm1_flash_part?.(m.chip === "uc25hq80" ? 1 : 0);   // ?chip=uc25hq80: the newer units' flash part
     const ahead = x.fm1_ahead ? m.ahead ?? AHEAD_FRAMES : 0;
     x.fm1_ahead?.(ahead);               // (?ahead=0: each quantum runs for its own frames only)
     // the whole update package (.fwsc): the machine unpacks it, gets the flash chip and the
@@ -197,6 +204,10 @@ class Fm1 extends AudioWorkletProcessor {
     }
     if (m.syx && x.fm1_load_syx(copy(m.syx), m.syx.byteLength) === 1) {
       throw new Error("this firmware cannot load that DX7 bank");
+    }
+    // a try-out's input script (web/tryout.js): UTF-8 bytes, played on the emulated clock from now
+    if (m.script?.byteLength && (!x.fm1_bench_script || x.fm1_bench_script(copy(m.script), m.script.byteLength) !== 0)) {
+      throw new Error("the input script did not load");
     }
     // a computer on the USB port, its playback stream open from the start (silence until fed)
     this.usb = !!(m.usb && x.fm1_usb_plug);

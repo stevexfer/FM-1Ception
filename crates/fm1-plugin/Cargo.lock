@@ -922,7 +922,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "fm1-core"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "fm1-isa",
  "serde",
@@ -930,11 +930,11 @@ dependencies = [
 
 [[package]]
 name = "fm1-isa"
-version = "0.3.0"
+version = "0.5.1"
 
 [[package]]
 name = "fm1-plugin"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "dispatch2",
@@ -942,6 +942,7 @@ dependencies = [
  "fm1-soc",
  "nih_plug",
  "nih_plug_egui",
+ "raw-window-handle 0.6.2",
  "rfd",
  "rtrb",
  "serde",
@@ -952,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "fm1-soc"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "bincode",
  "fm1-core",

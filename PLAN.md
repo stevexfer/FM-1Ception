@@ -1181,6 +1181,225 @@ What the counters say is left, by size (none done here):
 - Loads check RAM then XIP with two immediate pairs each; constants in the two spare callee-saved
   registers would save 2-4 instructions a load.
 
+## 5.35 The wasm JIT's FPU inline (2026-11-01)
+
+The float firmwares rendered below real time in the browser and clicked (Ravel 0.75x at 100 MHz)
+while the native JIT ran them at 2-3x: every FPU op (`3f e5`, fm1-isa's fpu.rs) left the
+generated wasm for the executor through `h_op` (269 M of Ravel's 1.93 G compiled instructions
+in 20 s; LOOM-8 31 M in 12 s). Now `block` computes them with wasm's own f32 instructions, which
+are the IEEE single precision the interpreter's Rust is in the same build, so the engine's own
+`fadd` makes both results, NaN payloads included:
+
+- `+ - * /`: `f32.add / sub / mul / div` on the registers reinterpreted (`f32.reinterpret_i32`,
+  back with `i32.reinterpret_f32`). `+` and `*` take b first: LLVM commuted the interpreter's
+  `x + y` and `x * y` for wasm, and when both operands are NaNs the engine passes the first
+  one's on (the self-test below found it: 0x7fc00000 + 0xffc00000).
+- `fmin` / `fmax`: not `f32.min` / `f32.max` (IEEE minimum / maximum, which propagate a NaN)
+  but the sequence LLVM expands Rust's `f32::min` / `max` into for wasm: `a' = a != a ? b : a`,
+  `b' = b != b ? a' : b`, `a' < b' ? a' : b'` (max: `>`). A NaN operand yields the other one;
+  equal operands (the two zeros) yield b, as the interpreter's build does. (jit.rs's `fminnm` /
+  `fmaxnm` are the same minNum semantics; on a tie of signed zeros they give the negative one.)
+- `ftoi` / `ftou` in the four roundings: `f32.nearest` (even) / `ceil` / `floor` first, then
+  `i32.trunc_sat_f32_s` / `_u` (0xfc 0 / 1), which truncates by itself (so the trunc rounding
+  emits nothing before it), saturates on overflow and sends a NaN to 0, as Rust's `as i32` /
+  `as u32`. `itof` / `utof`: `f32.convert_i32_s` / `_u`. `ftof`: nearest / trunc / ceil / floor.
+- The multiply-accumulates 7 / 8 (`R += R * R (f)`) stay with the executor, as in jit.rs (none
+  in the catalog's float firmwares: Ravel's and LOOM-8's FOp helper calls went to 0).
+- `fop_selftest` (`fm1_jit_selftest`, web/jit.test.mjs; skipped without a wasm build): every
+  inlined op alone in a block, on every pair of 44 edge values (NaNs with payloads, quiet and
+  signalling, both zeros, denormals, infinities, the integers' bounds, halves) and random words,
+  into a fresh, a source, a doubled and the second source register, must leave what `exec_fast`
+  leaves, and so must `run_fast` on the instruction word (the interpreter proper, its own copy
+  of the float code), in the engine at hand: the JIT's oracle test for wasm, as jit.rs's
+  random-state test is for AArch64.
+
+Ravel 0.74x -> 0.91x at 100 MHz (its quanta's p50 3.22 -> 2.46 ms), LOOM-8 2.87x -> 3.31x
+(interleaved A/B against the unchanged build, 20 s); PT/FM 1.32x and Felucca 2.37x unchanged:
+neither uses the FPU (PT/FM's helpers are `LdPre`, `StPre` and route 21's pair ops; Orange
+Cat, DUELL and FIZZ have no FPU ops either). JIT and interpreter audio byte-identical for
+Ravel, PT/FM, Felucca, Orange Cat, DUELL, LOOM-8 and FIZZ; the native catalog check unchanged
+(56 ok, 39 rebuilt). Bubba Machine (282 M FPU ops in 20 s) gives the same JIT audio as before,
+byte for byte, but its JIT and interpreter audio differ from 6.5 s on, with and without this
+change: that came with the cores' lock handover (d70ed00; at 52e1cb7 they agree), not with the
+FPU; its JIT also compiles 7500 regions in 20 s (RAM code dropped and rebuilt), 0.46x where the
+interpreter runs 1.15x.
+
+## 5.36 A countdown loop of one instruction runs its iterations in one go (2026-11-01)
+
+fm1-dock ran at 0.76x real time natively and 0.6x in the browser, every other firmware's speed
+notwithstanding, and its profile was unlike theirs: 76% of the browser's time in core 1's machinery
+(`run_stretch`, `run_cpu1`, `Jit::lookup`), 283 M `run_fast` calls for 297 M of core 1's instructions.
+Sampling both cores' pcs (fm1-live's `FM1_BENCH_PCS` samples core 0; a local patch added core 1)
+put half of all samples on one RAM address: `if (--r0 != 0) goto self` after `r0 = 256`, a software
+delay in core 1's polling loop. Each iteration is a block of one instruction that branches to its
+own start, and in a runner's stretch that start is the stop pc, so compiled code left after every
+iteration, on AArch64 as in wasm: one call per instruction, 60 M a second. The idle probe never
+matched, the counter differing at every visit.
+
+`run_fast` now runs such a block's iterations in one go, before the JIT or the interpreter sees it:
+a block of one `DecBr` with `!=` whose target is its own pc, entered at a call's start, runs as many
+iterations as fit the budget and the ticks before the next event (`tick_room`, as compiled code pays
+them: `add_ticks` for all but the first instruction of a call), the register down by one per
+iteration, the pc past the loop when the count ran out. Nothing else observes the iterations (one
+register, no bus), so the state after any number of instructions is the interpreter's; a stretch
+ends its call there and returns to the runner, as after a block run interpreted. In a stretch the
+iterations stop `STRETCH_ROOM` short of the budget, where compiled code's check at a block's entry
+would have stopped them (a review found the first version running up to 64 further than the
+compiled path on a count longer than the stretch; fm1-dock's 256 never is). One shape only: a
+two-instruction delay (`r -= 1; if r != 0 goto`) or another condition still pays a call per lap.
+
+fm1-dock: 0.76x -> 6.05x native, 0.59x -> 2.98x in the browser (node), no audio quantum over its
+2.9 ms where 1680 of 1723 were. Native CPU time unchanged to three digits on Felucca, X0X, Melodee
+and 386DX. Exactness: fm1-core's 66 and fm1-soc's 70 tests; the native catalog check, 94 ok, fm1-dock
+itself "rebuilt" (its 0.7 package is not the one hashed: JIT = interpreter, and master's audio over
+8 s with keys byte for byte; tests/catalog.json carries the new package and audio hashes); the wasm
+build's audio identical to master's on all 95.
+
+## 5.37 The wasm JIT goes from region to region without a round of run_fast's loop (2026-11-01)
+
+Counters on `jit_wasm::run`'s exits (a temporary build) said what ended a region run on Melodee:
+of 41 M in 5 s, half were edges out of the region (a jump or fall-through to a pc in another
+compiled region), each a round of `run_fast`'s loop: the block table, `Jit::lookup`, the region's
+RAM check, the call's prologue. `Jit` keeps a direct-mapped cache by pc of what `lookup` found
+(4096 entries; cleared with a dropped region and on `reset`), and after a region run that is not
+a stretch's call, `run_fast` goes straight to the region at the new pc while the budget allows and
+nothing careful is pending: `block_at` is pure, and what it checks of a RAM block `wasm_region_ok`
+checks of all the region's, so the round of the loop would have decided the same. A region that
+does not fit (k = 0) or was dropped goes round the loop as before, and nothing is tried once the
+next tick is due. An empty entry is one without a function (table index 0 is never a region's: a
+review found the first version's all-zero entry matching a jump to pc 0, a trap where `step`
+reports the fetch); a dropped region takes only its own entries out of the cache.
+
+On top of 5.35 and 5.36 (the wasm build of each, interleaved in node, the median of 3): Felucca
++7.8%, X0X +6.1%, 386DX +3.5%, Melodee +2.3%; byte-identical audio on all 95 catalog firmwares.
+Also tried in this pass, with the FPU, the six ops and the stretches that 5.35 brought: guest
+registers in wasm locals within a block (+1-5%, within what the rest moves; 5.35's author found
+the same and dropped it), a helper of its own for `sti` (neutral), SRAM2 as a third inline range
+(no gain, 3-6% code-size cost where it is unused). None kept.
+
+## 5.38 FM1_STRICT's tests out of the default run loop (2026-11-02)
+
+The realistic mode of #105 (FM1_STRICT and the CPU's guards, documented in docs/stock-firmware.md) tested `Cpu::cost_model` at four places in `run_fast`'s loop, once
+or twice per instruction, and `Soc::strict_align` before the alignment of every RAM read and
+write; both off, the default emulator paid for the tests. Against master before #105 (CPU seconds,
+interleaved, median of 5): interpreted zen and Melodee +31%, the browser build 3-6% slower, the
+native JIT 0-4%. The loop is generic over `COST` now as it is over `STRETCH` (5.33), the four
+tests `if COST`, `run_fast` / `run_stretch` picking the copy from `cost_model` once per call; the
+alignment tests test the address first, so an aligned access never loads the flag. Interpreted:
++31% -> +16-21%; the browser build back within noise; the JIT +2% (zp12 +4%).
+
+What is left of the interpreter's gap is not the per-block PC-limit check (`pc_enter`: 1-2%,
+measured with it taken out) nor the flash cache's test on XIP reads (0-3%); the rest of #105's
+per-block additions (`cpu0_between`'s guard and exception bookkeeping, `any_pending`'s extra
+field) are each a few instructions, and the `Cpu` and `Soc` structs grew. A native profile of
+the two builds side by side is the way to find it; the catalog check (interpreted, every
+firmware) is where it costs time, users run the JIT.
+
+## 5.39 Melodee 1.6.0's resource region: a package that is not the whole install (open 2026-11-02, solved 2026-11-13)
+
+**Solved, 2026-11-13:** the packages carry the region now, and their own update loader writes it
+after the app: a package entry of type 101 (`res.bin`). Melodee's loader writes it to its fixed
+`0xCB000` (keremimo/melodee firmware/loader/ldr_core.c `LDR_RES_LO`; the entry's word at +0x14 is
+0); fm1-base's, after Melodee's, writes it where that word says (felucca-bsp loader/ldr_core.c
+`ldr_res`: Polly 0.6.4's band styles, `RES1` at `0xAB000`; without them the band plays nothing,
+fm1-polly #7 on a real FM-1). The region's commit record tells the loaders apart (`MRS1`
+Melodee's, `RES1` fm1-base's). `fwsc::unpack` reads the last such entry as both loaders do
+(`Unpacked::res`: the record's CRC-32, the payload's length, whole sectors of the data area
+`0x97000`..`0xE0000`; a payload whose CRC does not check is written without its record) and
+`stock_from_package` lays it into the flash, as an install does, for fm1-live, fm1-emu, the plugin
+and the page alike. A `--flash FILE` saved before keeps the region erased (fm1-live saves the whole
+chip and restores every sector that differs): delete it, or start without it, once.
+Melodee 1.6.1 boots to its PROPHET screen with its factory sounds (its catalog hash changed: it
+was the "Setup unfinished" screen's). Items 1-3 below are not needed for a package that carries
+its region.
+
+Found filming the 0.4.0 release: the page booted Melodee 1.6.0 (on the Hub since 2026-11-02) to
+**Setup unfinished / Factory sounds missing / Install the update again**, where 1.4.5 boots to its
+PROPHET screen. 1.6.0 moved its factory sounds, the Rubik font and the Bluetooth radio program out of
+the application into a **resource region** of data flash, `0xCB000`-`0xDFFFF` (21 sectors, up to
+the OTA staging; `firmware/src/res.c`), read in place through XIP: a 32-byte header at `0xCB000`
+(magic `MRS1`, payload length, the payload's CRC-32, a header CRC written last as the commit record)
+and the payload from `0xCB020`. The region is **not in the package**: it is a file of its own,
+`melodee-1.6.0-res.bin` (53,876 bytes: the header, then the payload) among the GitHub release's
+assets, which the web installer fetches beside the package and writes through **editor command 82**
+over the editor's connection (`web/fm1res.js`: status `[0]`, begin `[1]` erases the region after
+moving old preset banks out, 256-byte chunks, verify). The Hub serves the package only
+(`fw/melodee-1.6.0-res.bin`: 404). Booted from its package alone, as every package boots here
+(docs/stock-firmware.md), the region is erased and the firmware asks for the update again. Older
+Melodee kept preset banks in that range, which is why the firmware moves them first.
+
+So "boots from its package, byte-identical" is no longer the whole install for every firmware: a
+firmware may need files its installer writes afterwards. Melodee is the first; the SMK-37's USR
+bank (5.34's layout) was the nearest thing before, solved by a bank of our own.
+
+What to do (not done):
+
+1. **fm1-live / fm1-emu:** `--res FILE[@ADDR]` (or a general `--flash-write ADDR FILE`): lay the
+   file into the flash image at `0xCB000` before the boot. Laid verbatim, the file is an installed
+   region (the header first, as `res.c` checks it: magic, length, CRC-32 of what follows).
+2. **The page:** the catalog entry names the resource file and its address (`"res": {"url", "at"}`),
+   fetched as the package is (from the author's release: CORS to check; the Hub does not mirror it)
+   and laid over the flash at boot, kept with the save as the package is. `?flash=` already lays
+   sectors over a try-out's flash, so a sector file made once from the installed region is the
+   quick way for fm1-dock-style try-outs.
+3. **The honest alternative,** the installer's path: feed command 82 with the file through the
+   emulated USB (fm1-live `--usb`, or a `FM1_BENCH_KEYS` `mHEX` script), which also tests Melodee's
+   `res_begin` / write / verify and the preset-bank migration. Worth doing once as a test; too slow
+   for every boot (the write is 256 bytes a round trip).
+4. **The catalog:** the Hub tool marks Bubba Machine "boots to a black screen" from before
+   jamminstein's fix, and the page's list (95) is behind the Hub's (148): refresh it, and when
+   Melodee moves to 1.6.0 there, its entry needs 2.
+
+Not a regression of 0.4.0: the page's catalog still pins `melodee-1.4.5.fwsc`, which runs; the
+1.6.0 package reached that page through `fetchPackage`'s fallback to the Hub's current package,
+taken when the pinned download fails (it failed once that evening, not again). 1.4.5 is the
+film's Melodee.
+## 5.40 A played note's delay: the plugin's lead as a setting (2026-11-04)
+
+A user of 0.4.0: "the trigger latency is still longer than 20 ms, including Mac AU plugin and
+browser". Where a note played live spends its time, at 44.1 kHz:
+
+- The plugin (AU and VST3 alike): the machine's thread runs one host block plus 1024 frames
+  ahead of the host (`lead`, crates/fm1-plugin/src/engine.rs), and a note from the host or the
+  window is taken at the frame that far ahead. With a 512-frame host buffer that is 35 ms, plus
+  the host's own output block, 12 ms, plus the firmware's. The plugin reports the lead as its
+  latency and the host makes up for it, but only for notes the host places itself; a played one
+  hears all of it.
+- The page: keys and MIDI go to the worklet as they happen and are applied at once, with the
+  machine up to one DMA half buffer ahead of the audio clock (5.29's pace: 0 for Felucca and
+  the stock firmware, 5.8 or 11.6 ms for the firmwares with 256- or 512-frame halves), plus
+  the AudioContext's output (`?latency=interactive`, a few ms on macOS).
+- The firmware itself, its key scan and DMA half, as on the device. Measured headless at
+  240 MHz (fm1-live --bench, FM1_BENCH_KEYS, a MIDI note or a key at a known ms to the first
+  sample off the level before it, so a slow attack counts): Felucca 6.4 / 7.6 ms (MIDI / key),
+  Melodee 7.2 / 7.6, Golana 3.6 / 4.7, Caravel 4.2 / 5.4, MC-1 3.6 / 33.8, FOMAJAM 38 / 40,
+  386DX 46 / 54, CS-1 46 / 63; AMB and DUB hundreds of ms, their pads' attacks.
+
+So the plugin's fixed 1024 frames (23 ms) were the largest single piece under our control.
+It is now a setting, "Lead" in the window and a host parameter (`lead`, non-automatable):
+23 ms as before (the default, so projects play as they did), 12 ms or 6 ms. Changing it sends
+the machine's thread the new lead and tells the host the new latency (`set_latency_samples`
+from `process`). A lead that is too short for the emulation's uneven pace shows as "frames
+late" in the status bar, which is the user's cue to go back up. The machine's thread reads the
+parameter every round (the host's block it is told once); the latency report goes through
+nih-plug's CLAP wrapper, which while processing asks the host for a restart, and clap-wrapper's
+AU side does nothing on that request, so an AU host keeps the old latency for its sequenced
+notes until the plugin is loaded again (VST3 and CLAP hosts take it at once). Shrinking the
+lead while playing also leaves the frames already rendered at the old lead in the ring for one
+old lead's time, during which stamped notes are taken as they come: a hiccup of under 20 ms,
+once per change. With a 128-frame host buffer
+and the 6 ms lead a Felucca note sounds about 20 ms after the key: 9 ms lead and block, 3 ms
+the host's block, 7 ms Felucca's own, plus the driver.
+
+Not done, in the order it would pay:
+- A measured number on the status bar: the lead in ms, plus the host's block, so the user sees
+  what the setting does instead of a name.
+- The page: a note is applied where the machine is, up to a half buffer ahead; stamping it to
+  the frame the audio clock is at would cost that half buffer back, but the machine has
+  already rendered past it. Only a smaller pace (`?ahead=256` exists) helps, at 5.29's cost.
+- The device's own figure for comparison: the probes of [harbor-probes] could time a MIDI note
+  to the DAC on the chip. Without it, the firmware column above is the emulator's word.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

@@ -38,8 +38,8 @@ you would install on a real FM-1:
 
 - **Community firmwares:** [the FM-1 Firmware Hub](https://thefirmwarehub.com/) and
   [fm1-editor.com](https://fm1-editor.com/firmware/) link each author's releases. fm1-emu's
-  [README](https://github.com/joakimeriksson/fm1-emu#what-runs) lists the 80-plus that run in the
-  emulator, and you can try any of them in your browser at
+  [firmware list](https://github.com/joakimeriksson/fm1-emu/blob/master/docs/FIRMWARES.md) covers
+  the 200 that run in the emulator, and you can try any of them in your browser at
   [joakimeriksson.github.io/fm1-emu](https://joakimeriksson.github.io/fm1-emu/).
 - **M-VAVE's stock firmware:** download `FM-1.fwsc` from M-VAVE. It is much heavier to emulate
   than the community firmwares: on an Apple silicon Mac it runs at about half of real time while

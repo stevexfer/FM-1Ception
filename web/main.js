@@ -3,8 +3,9 @@
 // that runs the emulator. Every firmware boots from its whole update package (.fwsc), unpacked
 // in the wasm: a catalog entry's fetched from its author's site, or one opened from this
 // computer (M-VAVE's own: their server does not let other pages fetch it).
-import { fetchPackage } from "./fwsc.js";
+import { fetchPackage, hubNewcomers, hubCardUrl } from "./fwsc.js";
 import { SaveStore, packageHash, changedSectors, packSectors, exportSave, importSave } from "./persistence.js";
+import { tryOutOf, loadTryOut } from "./tryout.js";
 
 const CLOCKS = [60, 80, 100, 120, 160, 200, 240];
 // The device this page is for: the FM-1 (index.html) or the SMK-37 (smk37/index.html, <html
@@ -21,6 +22,13 @@ const stored = (k) => { try { return localStorage.getItem(k); } catch { return n
 const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 
 const catalog = await (await fetch("firmwares.json")).json();
+// The Hub's firmwares not in the file yet, listed last as not yet run here (none when the Hub
+// does not answer in time; the read goes on for the package fallback). The SMK-37's list is its own.
+let hubWait;
+const newcomers = DEVICE === "fm1"
+  ? await Promise.race([hubNewcomers(catalog), new Promise((ok) => { hubWait = setTimeout(() => ok([]), 3000); })]).finally(() => clearTimeout(hubWait))
+  : [];
+catalog.firmwares.push(...newcomers);
 const byId = new Map(catalog.firmwares.map((f) => [f.id, f]));
 // the FM-1 Firmware Hub's ids too, where they differ (its cards link here with ?fw=<its id>)
 for (const f of catalog.firmwares) if (f.hub && !byId.has(f.hub)) byId.set(f.hub, f);
@@ -28,7 +36,47 @@ for (const f of catalog.firmwares) if (f.hub && !byId.has(f.hub)) byId.set(f.hub
 // <head> set data-embed before the first paint; style.css hides the rest). It does not change the
 // firmware this browser starts with on the full page.
 const EMBED = document.documentElement.hasAttribute("data-embed");
-let fw = byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
+// ?chip=uc25hq80 (or new): the FM-1 with the flash part of units sold since autumn 2026 (UC25HQ80,
+// JEDEC B3 60 14) in place of the stock Puya P25Q80: a firmware that knows only the Puya keeps its
+// saves in RAM there, as on those units. For firmware authors to try theirs.
+const CHIP = ["uc25hq80", "new"].includes((params.get("chip") || "").toLowerCase()) ? "uc25hq80" : "p25q80";
+// ?package=URL: a package on another site (https), for a page that lists firmware this one does not
+// (mutant.cloud's "Try", other hubs, older versions); &name= names it. It plays like a catalog entry,
+// its saved flash kept by its package as every firmware's is, and is not added to the list for later.
+const linked = linkedFirmware(params);
+if (linked) byId.set(linked.id, linked);
+let fw = linked || byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
+// ?flash= / ?script=: a try-out of that firmware (web/tryout.js), from this site's own files: a session of its
+// own (this browser's saved flash neither loaded nor saved), started at once where the browser lets it play
+let tryOut = null, tryOutError = null;
+try {
+  tryOut = tryOutOf(params, location.href);
+  if (tryOut) Object.assign(tryOut, { fw, files: null, told: null });
+} catch (error) { tryOutError = `try-out: ${error.message}`; }
+// how the try-out goes, to the page that embeds this one when it is on this origin (never elsewhere)
+function tell(state, text = "") {
+  if (typeof window === "undefined" || window.parent === window) return;
+  try { window.parent.postMessage({ source: "fm1-emu", type: "tryout", state, text }, location.origin); } catch { /* not ours */ }
+}
+function linkedFirmware(q) {
+  let url;
+  try { url = new URL(q.get("package")); } catch { return null; }
+  if (url.protocol !== "https:") return null;
+  const raw = url.pathname.split("/").pop() || url.host;
+  let file = raw;
+  try { file = decodeURIComponent(raw); } catch { /* a malformed escape: the name as written */ }
+  file = file.replace(/\.fwsc$/i, "");
+  return { id: "link", name: q.get("name") || file, version: "", author: "", license: "", about: "",
+    repo: url.href, package: url.href, link: true };
+}
+function endTryOut() {
+  if (!tryOut) return;
+  tryOut = null;
+  const q = new URLSearchParams(location.search);
+  q.delete("flash");
+  q.delete("script");
+  history.replaceState(null, "", `?${q}`);
+}
 let mhz = Number(params.get("mhz") || stored("fm1.mhz") || 100);
 // the audio buffer: "interactive" (small: keys answer quickly) unless this device needed a larger
 // one ("playback", offered when the sound drops out with time to spare; ?latency= overrides)
@@ -103,7 +151,14 @@ function setBoard(b) {
 setBoard(DEV.board);
 
 // ---------------------------------------------------------------- firmware and clock
-for (const f of catalog.firmwares) fwSel.add(new Option(`${f.name} ${f.version}`, f.id));
+for (const f of catalog.firmwares) if (!f.untested) fwSel.add(new Option(`${f.name} ${f.version}`, f.id));
+if (newcomers.length) {
+  const group = document.createElement("optgroup");
+  group.label = "New on the Hub, not yet run here";
+  for (const f of newcomers) group.append(new Option(`${f.name} ${f.version}`, f.id));
+  fwSel.append(group);
+}
+if (linked) fwSel.add(new Option(`${linked.name} (from a link)`, linked.id), 0);
 for (const c of new Set([...CLOCKS, mhz].sort((a, b) => a - b))) mhzSel.add(new Option(`${c} MHz`, c));
 fwSel.value = fw.id;
 mhzSel.value = mhz;
@@ -116,7 +171,8 @@ const MIDI_NOTES = {
   choralroot: NO_NOTE, hortator: NO_NOTE, "sloop-alg": NO_NOTE, x0x: NO_NOTE,
 };
 const cards = new Map();
-const hubCard = (f) => `https://thefirmwarehub.com/#fw-${f.hub}`;
+const hubCard = (f) => hubCardUrl(f.hub);
+const UNTESTED = "New on the Hub: not yet run in the emulator, so it may not work here";
 // the FM-1 page: which entries have an SMK-37 build (that catalog names them)
 const twins = new Map();
 if (DEVICE === "fm1") {
@@ -162,6 +218,7 @@ if (DEVICE === "fm1") {
       el("p", "what", f.byo && DEVICE === "fm1" ? "The firmware the FM-1 ships with: a DX7-style FM synth, both cores running. " +
         "Bring your own copy (see below)." : f.about));
     if (DEVICE === "fm1" && MIDI_NOTES[f.id]) card.append(el("div", "midi", MIDI_NOTES[f.id]));
+    if (f.untested) card.append(el("div", "untested", UNTESTED));
     card.append(links);
     list.append(card);
     cards.set(f.id, card);
@@ -179,7 +236,7 @@ async function keptEntry(id) {
 async function packageOf(f) {
   if (f.id === "local") return { bytes: f.bytes, url: null };
   if (packages.has(f.id)) return packages.get(f.id);
-  const kept = await keptEntry(f.id);
+  const kept = !f.link && await keptEntry(f.id);   // (a link's entry is whichever link ran last)
   if (kept) {
     const got = { bytes: kept.package, url: kept.url };
     packages.set(f.id, got);
@@ -233,6 +290,8 @@ function showFirmware() {
   let parts;
   if (fw.id === "local") {
     parts = [b, "Opened from this computer; kept with its saved flash after Start."];
+  } else if (fw.link) {
+    parts = [b, "From a link: not in this page's list, so it may not run here."];
   } else if (fw.byo) {
     const dl = document.createElement("a");
     dl.href = fw.download;
@@ -262,6 +321,12 @@ function showFirmware() {
     what.className = "what";
     what.textContent = fw.about;
     parts = [b, `by ${fw.author}`, links, what];
+    if (fw.untested) {
+      const note = document.createElement("span");
+      note.className = "untested";
+      note.textContent = UNTESTED + ".";
+      parts.push(" ", note);
+    }
   }
   if (loadedUrl) {
     const p = document.createElement("a");
@@ -273,15 +338,20 @@ function showFirmware() {
   const q = new URLSearchParams(location.search);
   q.set("fw", fw.id);
   q.set("mhz", mhz);
+  if (!fw.link) { q.delete("package"); q.delete("name"); }
   history.replaceState(null, "", `?${q}`);
-  document.getElementById("fullpage").href = fw.id === "local" ? "./" : `./?fw=${fw.id}`;
+  const full = new URLSearchParams(fw.id === "local" ? "" : { fw: fw.id });
+  if (fw.link) for (const k of ["package", "name"]) if (q.has(k)) full.set(k, q.get(k));
+  if (tryOut) for (const k of ["flash", "script"]) if (q.has(k)) full.set(k, q.get(k));
+  document.getElementById("fullpage").href = `./${String(full) ? `?${full}` : ""}`;
 }
 showFirmware();
 
 fwSel.addEventListener("change", () => {
   fw = byId.get(fwSel.value) || localFw;
+  endTryOut();
   loadedUrl = null;
-  if (!EMBED) store(DEV.key + "fw", fw.id);
+  if (!EMBED && !fw.link) store(DEV.key + "fw", fw.id);   // a link is not kept: the next visit has the last pick
   showFirmware();
   fwSel.blur();                 // back to playing from the keyboard
   // (a firmware whose codec runs at another rate gets an audio context at that rate)
@@ -744,7 +814,8 @@ const perf = {
     const loads = this.loads.map((l) => Math.round(100 * l)), jit = this.jit;
     return [
       `FM-1 emulator report (${location.origin}${location.pathname})`,
-      `firmware: ${fw.id} ${fw.version || ""} · clock ${mhz} MHz · JIT ${params.get("jit") === "0" ? "off" : "on"}`,
+      `firmware: ${fw.id} ${fw.version || ""} · clock ${mhz} MHz · JIT ${params.get("jit") === "0" ? "off" : "on"}` +
+        (CHIP === "p25q80" ? "" : ` · flash ${CHIP}`),
       `browser: ${navigator.userAgent}`,
       `cores: ${navigator.hardwareConcurrency ?? "?"} · memory: ${navigator.deviceMemory ?? "?"} GB`,
       `audio: ${ac ? `${ac.sampleRate} Hz, buffer "${latency}", base latency ${r(1000 * (ac.baseLatency ?? NaN), 1)} ms, ` +
@@ -820,6 +891,11 @@ function sameSectors(a, b) {
 function saveSnapshot(session, flash, flashRevision) {
   session.flash = flash;
   const sectors = changedSectors(session.base, flash);
+  if (session.ephemeral) {                 // a try-out: kept for an export, never stored
+    session.record = { ...session.record, sectors };
+    if (running === session) saveMessage("A try-out: not saved in this browser (Export a backup keeps it)");
+    return Promise.resolve();
+  }
   session.record = { ...session.record, sectors };
   memoryRecords.set(session.record.hash, session.record);
   if (!session.forceSave && session.revision && sameSectors(session.persistedSectors || [], sectors)) {
@@ -874,23 +950,33 @@ function boot(options = {}) {
   const task = async () => {
     if (seq !== bootSeq) return false;
     const importedBank = bank;
-    let got;
+    let got, trying = null;
     try {
       got = await packageOf(f);
+      if (tryOut && tryOut.fw === f && !options.imported) {
+        tell("loading");
+        try {
+          trying = tryOut.files ||= await loadTryOut(tryOut, fetch);
+        } catch (error) {             // (the firmware boots as it would without the try-out)
+          tell("error", error.message);
+          tryOutError = `try-out: ${error.message}`;
+          endTryOut();
+        }
+      }
       const hash = await packageHash(got.bytes);
-      let record = memoryRecords.get(hash);
-      if (!record) {
+      let record = trying ? null : memoryRecords.get(hash);
+      if (!record && !trying) {
         try { record = await saveStore.load(hash); } catch (error) { saveFailure(error); }
       }
       if (seq !== bootSeq) return false;
       await flushRunning(true);
       // flushRunning may have updated this firmware's most recent snapshot.
-      record = options.imported
+      record = trying ? null : options.imported
         ? { ...options.imported, revision: memoryRecords.get(hash)?.revision || options.imported.revision }
         : memoryRecords.get(hash) || record;
       if (options.reset) record = { ...record, sectors: [] };
-      const sectors = record?.sectors || [];
-      const session = { seq, forceSave: !!(options.reset || options.imported || record?.unsaved),
+      const sectors = trying ? trying.sectors : record?.sectors || [];
+      const session = { seq, ephemeral: !!trying, forceSave: !!(options.reset || options.imported || record?.unsaved),
         persistedSectors: record?.sectors || [], entry: DEV.key + f.id, revision: record?.revision || 0,
         record: { version: 1, hash, name: f.name, byo: !!(f.byo || record?.byo), device: DEVICE, package: got.bytes, url: got.url,
           sectors, revision: record?.revision || 0 } };
@@ -912,11 +998,13 @@ function boot(options = {}) {
       });
       node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
         sectors: packSectors(sectors).buffer, syx: importedBank ? importedBank.slice().buffer : null,
-        mhz: clock, jit: params.get("jit") !== "0", usb: !!f.usb, frameNs: f.frameNs || 0,
+        script: trying?.script ? new TextEncoder().encode(trying.script).buffer : null,
+        mhz: clock, jit: params.get("jit") !== "0", chip: CHIP, usb: !!f.usb, frameNs: f.frameNs || 0,
         // (?ahead=0: each quantum emulates only for its own frames, as before the even pace)
         ahead: params.has("ahead") ? Number(params.get("ahead")) : undefined });
       status.textContent = `booting ${f.name}…`;
       if (f.usb) kalimbaLoad().catch((e) => { kalimbaState.textContent = `no samples: ${e.message}`; });
+      if (trying) { tryOut.told = null; tell("booting"); }
       await ready;
       if (bank === importedBank) bank = null; // imports seed flash once; saved edits win on later boots
       return true;
@@ -926,6 +1014,7 @@ function boot(options = {}) {
       node?.port.postMessage({ type: "resume" });
       if (seq === bootSeq) status.textContent = error instanceof NeedFile
         ? `${f.name}: open your ${DEV.stock} to boot it` : `${f.name}: ${error.message}`;
+      if (trying) tell("error", error.message);
       return false;
     }
   };
@@ -936,8 +1025,18 @@ function boot(options = {}) {
 // the audio graph: a context with the chosen buffer, the emulator's worklet node in it
 // the rate a firmware's audio runs at: its catalog entry's `rate`, or the stock 44.1 kHz
 const rateOf = (f) => f.rate || 44100;
-async function startAudio() {
+async function startAudio(auto = false) {
   ac = new AudioContext({ sampleRate: rateOf(fw), latencyHint: latency });
+  // (auto: without a click, only where the browser lets this page play: else the context is closed again)
+  if (auto && ac.state !== "running" && !await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 500);
+    ac.onstatechange = () => { if (ac.state === "running") { clearTimeout(timer); resolve(true); } };
+  })) {
+    ac.onstatechange = null;
+    await ac.close();
+    ac = null;
+    return false;
+  }
   await ac.audioWorklet.addModule("worklet.js");
   node = new AudioWorkletNode(ac, "fm1", { numberOfInputs: 0, outputChannelCount: [2] });
   node.connect(ac.destination);
@@ -946,6 +1045,7 @@ async function startAudio() {
   // Boot now waits for a worklet acknowledgement; let its thread run even on browsers
   // that create an AudioContext suspended until the Start gesture is resumed explicitly.
   await ac.resume();
+  return true;
 }
 
 // what the audio thread sends: the screen and LEDs with its timing, boot and error news
@@ -966,7 +1066,7 @@ function onWorklet(e) {
   if (m.type === "flash-changed") {
     const session = sessions.get(m.seq);
     if (session) session.observedRevision = m.revision;
-    if (session === running) saveMessage("Saving…");
+    if (session === running && !session.ephemeral) saveMessage("Saving…");
     return;
   }
   if (m.type === "snapshot") {
@@ -999,6 +1099,10 @@ function onWorklet(e) {
     return;
   }
   if (m.type !== "frame" || booting || m.seq !== bootSeq) return;
+  if (running?.ephemeral && tryOut?.files && tryOut.told !== m.seq && m.ms >= tryOut.files.end + 500) {
+    tryOut.told = m.seq;                          // (its input script has played: the machine is the visitor's)
+    tell("playing");
+  }
   // Preserve an update not yet drawn when a status-only message arrives.
   if (!m.lcd && frame?.lcd) m.lcd = frame.lcd;
   frame = m;
@@ -1006,9 +1110,9 @@ function onWorklet(e) {
   const now = performance.now();
   if (!last || now - last.t > 1000) {
     perf.second(m);
-    status.textContent = m.halted ? `${fw.name}: the emulated CPU halted` :
+    status.textContent = (tryOutError ? `${tryOutError} · ` : "") + (m.halted ? `${fw.name}: the emulated CPU halted` :
       `${fw.name} · ${mhz} MHz · ${perf.speedText()} · load ${perf.loadText()} · ` +
-      `${(m.ms / 1000).toFixed(1)} s`;
+      `${(m.ms / 1000).toFixed(1)} s`);
     // (hover: what the figures mean, the JIT's work in the audio thread, and the audio's health)
     status.title = [`speed: how much faster than real time the emulator runs this firmware on this device ` +
       `(emulated time per time spent emulating; below 1x the sound breaks up)`,
@@ -1019,18 +1123,29 @@ function onWorklet(e) {
   }
 }
 
-startBtn.addEventListener("click", async () => {
+async function start(auto = false) {
   startBtn.disabled = true;
   status.textContent = "starting audio…";
-  if (!node) await startAudio();
+  if (!node && !await startAudio(auto)) {         // (auto: the browser wants a click first)
+    startBtn.disabled = false;
+    status.textContent = "click Start to play the try-out";
+    tell("start");
+    return;
+  }
   const started = await boot();
   if (!started) { startBtn.disabled = false; return; }
   if (midiSel.value) midiOpen();                  // (an input picked on an earlier visit)
   await ac.resume();
   startBtn.hidden = true;
   // a phone on its side: the synth fills the screen, so bring all of it into view
-  if (matchMedia("(orientation: landscape) and (max-height: 560px)").matches) canvas.scrollIntoView({ block: "center" });
-});
+  if (!auto && matchMedia("(orientation: landscape) and (max-height: 560px)").matches) canvas.scrollIntoView({ block: "center" });
+}
+startBtn.addEventListener("click", () => start());
+if (tryOutError) status.textContent = tryOutError;
+else if (tryOut) {
+  saveMessage("A try-out: it starts from the firmware's own flash and is not saved in this browser");
+  start(true);
+}
 
 // Persistence controls use the running machine's identity, even while another firmware is selected.
 const action = fn => async () => { try { await fn(); } catch (error) { saveFailure(error); } };
