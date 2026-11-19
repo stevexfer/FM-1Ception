@@ -1,0 +1,22 @@
+---
+description: Releasing FM-1Ception (a new beta or version): the what's-new entry and the download page
+alwaysApply: true
+---
+
+# What's new, for every release
+
+- Every release (a new `fm1ception/installer/label.txt`) gets an entry in the version history,
+  `web/site/fm1ception/history.html` in the FM1ShrubOS repository (live at `https://shrub.audio/fm1ception/history`).
+  Newest first; older entries are never rewritten.
+- Draft the entry from the commits since the last release (`git log` from the previous `Beta 1.0.0bN` commit):
+  - a heading with the version as the page writes it (`1.0.0 beta 6`) and the date;
+  - a few bullets in plain words, as a user would see the change, a bold lead-in for each;
+  - internal work (build scripts, tests, the facts pipeline, signing) is left out.
+- Show the user the entry's exact text and wait for approval (the user, 2026-11-19: "I should probably approve the type
+  each time"). Nothing is published without it.
+- With the text approved, in FM1ShrubOS:
+  1. Add the entry to `history.html`; update `index.html`'s version line and both download links.
+  2. Commit only those files (that repository often has unrelated work in progress).
+  3. Deploy with `SHRUB_FIRMWARE=keep sh tools/deploy_editor.sh`, which publishes the site without touching
+     Shrub's firmware, and check `https://shrub.audio/fm1ception/history` afterwards.
+- The page names neither Shrub nor Hotwire.
