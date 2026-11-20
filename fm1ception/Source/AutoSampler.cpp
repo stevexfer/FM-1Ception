@@ -124,7 +124,21 @@ AutoSampler::~AutoSampler()
 AutoSampler::Status AutoSampler::status() const
 {
     const juce::ScopedLock sl (lock);
-    return state;
+    auto st = state;
+    if (st.stage == Stage::scouting && sampler != nullptr)
+    {
+        // the PRESETS knob's progress through first..last, and the name it reached last
+        const int first = juce::jlimit (1, 127, settings.firstProgram), last = juce::jlimit (first, 127, settings.lastProgram);
+        const int k = juce::jlimit (first, last, (int) fm1e_sampler_scouted (sampler));
+        std::string said (fm1e_sampler_scouting_said (sampler, nullptr, 0), '\0');
+        fm1e_sampler_scouting_said (sampler, (juce::uint8*) said.data(), said.size());
+        std::string name (256, '\0');
+        name.resize (fm1e_preset_name (said.c_str(), settings.stripNumbers, (juce::uint8*) name.data(), name.size()));
+        st.progress = (double) (k - first + 1) / (double) (last - first + 1);
+        st.text = "Finding the programs: " + juce::String (k) + " of " + juce::String (last)
+                + (name.empty() ? juce::String() : "  (" + juce::String (name) + ")");
+    }
+    return st;
 }
 
 std::vector<AutoSampler::Program> AutoSampler::programs() const
@@ -365,7 +379,7 @@ bool AutoSampler::capturePrograms()
         {
             sounded += n.info.silent ? 0 : 1;
             looped += n.info.hasLoop ? 1 : 0;
-            capped += ! n.info.silent && ! n.info.settled ? 1 : 0;
+            capped += settings.holdMs() == 0 && ! n.info.silent && ! n.info.settled ? 1 : 0;
         }
         report (number + label + ": written, " + juce::String (sounded) + " notes, " + juce::String (looped) + " looped"
                 + (capped > 0 ? ", " + juce::String (capped) + " never settled (held "
@@ -492,7 +506,8 @@ juce::String AutoSampler::writeProgram (const juce::File& folder, const juce::St
         if (out == nullptr)
             return "Could not write " + file.getFullPathName();
         auto writer = flac.createWriterFor (out, juce::AudioFormatWriterOptions().withSampleRate (fileRate)
-                                                     .withNumChannels (ch).withBitsPerSample (24));
+                                                     .withNumChannels (ch).withBitsPerSample (16)
+                                                     .withQualityOptionIndex (flac.getQualityOptions().size() - 1));
         if (writer == nullptr || ! writer->writeFromAudioSampleBuffer (buf, 0, frames))
             return "Could not write " + file.getFullPathName();
         writer.reset();

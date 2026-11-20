@@ -41,8 +41,9 @@ pub struct Sampler {
     /// whether the start fell quiet with no note held
     pub quiet: bool,
     programs: Mutex<Vec<Program>>,
-    /// programs scouted so far, for a progress bar
+    /// programs scouted so far, for a progress bar, and what the newest one said
     pub scouted: AtomicU32,
+    pub scouting_said: Mutex<String>,
 }
 
 /// What a note is held for.
@@ -144,6 +145,7 @@ impl Sampler {
             quiet,
             programs: Mutex::new(vec![Program { said: String::new(), moment }]),
             scouted: AtomicU32::new(1),
+            scouting_said: Mutex::new(String::new()),
         })
     }
 
@@ -192,17 +194,24 @@ impl Sampler {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            click(&mut step, 1);
-            run_ms(&mut step, SETTLE_MS);
             reader.said.clear();
-            if reader.on {
-                click(&mut ear, 1);
-                reader.run(&mut ear, SETTLE_MS);
-            }
+            // the two copies side by side: the one the audio comes from, and the one with the cable
+            std::thread::scope(|sc| {
+                let stepping = sc.spawn(|| {
+                    click(&mut step, 1);
+                    run_ms(&mut step, SETTLE_MS);
+                });
+                if reader.on {
+                    click(&mut ear, 1);
+                    reader.run(&mut ear, SETTLE_MS);
+                }
+                let _ = stepping.join();
+            });
             if step.halted {
                 break;
             }
             let said = reader.said.first().cloned().unwrap_or_default();
+            let said_now = said.clone();
             let now = screen_hash(&step);
             let moved = now != screen || !said.is_empty();
             let round = (!said1.is_empty() && said == said1) || (said1.is_empty() && now == screen1);
@@ -214,6 +223,7 @@ impl Sampler {
                 let (sectors, state) = step.save_state(&self.pkg)?;
                 found.push(Program { said, moment: Moment { sectors: Arc::new(sectors), state: Arc::new(state) } });
             }
+            *self.scouting_said.lock().unwrap() = said_now;
             self.scouted.store(k as u32, Ordering::Relaxed);
         }
         if found.is_empty() {
@@ -723,6 +733,16 @@ pub unsafe extern "C" fn fm1e_sampler_scout(s: *const Sampler, first: u32, last:
 #[no_mangle]
 pub unsafe extern "C" fn fm1e_sampler_scouted(s: *const Sampler) -> u32 {
     (*s).scouted.load(Ordering::Relaxed)
+}
+
+/// What the newest program fm1e_sampler_scout reached said (as fm1e_sampler_said); its length.
+///
+/// # Safety
+/// `s` a live sampler; `out` writable for `cap` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn fm1e_sampler_scouting_said(s: *const Sampler, out: *mut u8, cap: usize) -> usize {
+    let said = (*s).scouting_said.lock().unwrap().clone();
+    crate::copy_out(said.as_bytes(), out, cap)
 }
 
 /// # Safety

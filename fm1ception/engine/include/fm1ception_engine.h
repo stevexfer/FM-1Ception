@@ -152,6 +152,8 @@ bool fm1e_sampler_quiet (const Fm1eSampler*);
 int fm1e_sampler_scout (const Fm1eSampler*, uint32_t first, uint32_t last, const void* cancel,
                         char* msg, size_t msgCap);
 uint32_t fm1e_sampler_scouted (const Fm1eSampler*);
+/* what the newest program fm1e_sampler_scout reached said, while it runs (as fm1e_sampler_said) */
+size_t fm1e_sampler_scouting_said (const Fm1eSampler*, uint8_t* out, size_t cap);
 uint32_t fm1e_sampler_programs (const Fm1eSampler*);
 /* what the reader said at program i (ASCII, not terminated; empty: nothing); returns its length */
 size_t fm1e_sampler_said (const Fm1eSampler*, uint32_t i, uint8_t* out, size_t cap);

@@ -9,9 +9,10 @@ namespace fm1c
 // AutoSample: an engine's sound as an SFZ multisample (engine/src/autosample.rs
 // renders the notes). The notes go from Root to Top every Span semitones (and Top
 // itself), each held for a time or until it settles, its release recorded after.
-// Each program is one SFZ: its samples normalised together to -1 dB peak, as 24-bit
-// FLAC at the firmware's own rate, mono where left and right are the same, each
-// sample's zone centred on it, one line per region. A run goes in a folder of its
+// Each program is one SFZ: its samples normalised together to -1 dB peak, as 16-bit
+// FLAC at its highest compression (the emulator's own depth: 24 bits after the gain
+// would only add noise FLAC cannot pack) at the firmware's own rate, mono where left
+// and right are the same, each sample's zone centred on it, one line per region. A run goes in a folder of its
 // own in Serum 2's Multisamples/FM-1 (macOS: /Library/Audio/Presets/Xfer Records/Serum 2
 // Presets; Windows: Documents\Xfer\Serum 2 Presets).
 //==============================================================================

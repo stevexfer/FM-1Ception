@@ -2198,13 +2198,13 @@ int main (int argc, char** argv)
                         rates = false;
                         continue;
                     }
-                    rates &= (int) r->sampleRate == 44100 && r->bitsPerSample == 24 && r->lengthInSamples > 1000;
+                    rates &= (int) r->sampleRate == 44100 && r->bitsPerSample == 16 && r->lengthInSamples > 1000;
                     juce::Range<float> ranges[2];
                     r->readMaxLevels (0, r->lengthInSamples, ranges, (int) juce::jmin (2u, r->numChannels));
                     for (unsigned c = 0; c < juce::jmin (2u, r->numChannels); ++c)
                         peak = juce::jmax (peak, std::abs (ranges[c].getStart()), std::abs (ranges[c].getEnd()));
                 }
-                check (rates, "AutoSample: 24-bit FLAC at 44.1 kHz");
+                check (rates, "AutoSample: 16-bit FLAC at 44.1 kHz");
                 check (std::abs (juce::Decibels::gainToDecibels (peak) + 1.0f) < 0.1f,
                        "AutoSample: normalised together to -1 dB (" + juce::String (juce::Decibels::gainToDecibels (peak), 2) + " dB)");
             }
