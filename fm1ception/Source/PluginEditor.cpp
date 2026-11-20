@@ -180,6 +180,7 @@ FM1CeptionEditor::~FM1CeptionEditor()
 {
     stopTimer();
     libraryWindow.reset();
+    autoSampleWindow.reset();
     views.clear();
     setConstrainer (nullptr);
     setLookAndFeel (nullptr);
@@ -785,6 +786,7 @@ void FM1CeptionEditor::showEngineMenu (int slot, int lcdRow)
     m.addItem ("Init Engine", loaded, false, [p = &proc, slot] { p->initEngine (slot); });
     m.addItem ("Duplicate to All Engines", loaded && proc.getNumEngines() > 1, false,
                [safe, slot] { if (safe) safe->confirmDuplicate (slot); });
+    m.addItem ("AutoSample...", loaded, false, [safe, slot] { if (safe) safe->showAutoSample (slot); });
 
     // soft knobs: where this firmware draws KNOB1..4 on its screen, kept per firmware
     const int soft = views[slot]->softKnobRow();
@@ -898,6 +900,27 @@ void FM1CeptionEditor::showLibrary()
         libraryWindow = std::make_unique<LibraryWindow> (library->library, &library->cloud, std::move (engines), &library->screens);
     }
     libraryWindow->show();
+}
+
+void FM1CeptionEditor::showAutoSample (int slot)
+{
+    auto h = proc.engine (slot);
+    if (h == nullptr || ! h->hasFirmware())
+        return;
+    // the channel the firmware hears: as the engine's MIDI routing sends it, else 1
+    int ch = proc.getFirmwareChannel (slot);
+    if (ch == 0 && proc.getMidiMode() == FM1CeptionProcessor::MidiMode::custom)
+        ch = proc.getReceiveChannel (slot);
+    if (proc.getMidiMode() == FM1CeptionProcessor::MidiMode::multiChannel || ch < 1)
+        ch = 1;
+    autoSampleWindow.reset();
+    autoSampleWindow = std::make_unique<fm1c::AutoSampleWindow> (h, h->firmwareName(), ch, "AutoSample  -  " + engineLabel (slot));
+    juce::Component::SafePointer<FM1CeptionEditor> safe (this);
+    autoSampleWindow->onClose = [safe]
+    {
+        if (safe)
+            juce::MessageManager::callAsync ([safe] { if (safe) safe->autoSampleWindow.reset(); });
+    };
 }
 
 void FM1CeptionEditor::chooseFile (int slot, bool exporting)

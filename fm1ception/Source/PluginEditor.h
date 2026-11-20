@@ -5,6 +5,7 @@
 #include "EngineView.h"
 #include "OutputMeter.h"
 #include "LibraryWindow.h"
+#include "AutoSampleWindow.h"
 
 //==============================================================================
 // A minimal header (title, MENU, the main volume meter, ENGINES 1..8) over
@@ -114,10 +115,13 @@ private:
     juce::PopupMenu presetsMenu (int slot, bool withFolderItem);
     void savePresetAs (int slot);
     void showLibrary();
+    /** The engine's AutoSample window (one at a time: another engine's replaces it). */
+    void showAutoSample (int slot);
 
     FM1CeptionProcessor& proc;
     juce::SharedResourcePointer<fm1c::SharedFirmwareLibrary> library;
     std::unique_ptr<fm1c::LibraryWindow> libraryWindow;
+    std::unique_ptr<fm1c::AutoSampleWindow> autoSampleWindow;
     juce::LookAndFeel_V4 lnf;
     juce::TextButton menuButton { "MENU" };
     fm1c::OutputMeter meter;

@@ -357,10 +357,11 @@ fn record(m: &mut Machine, s: &Sampler, spec: &Spec, cancel: &AtomicBool) -> Res
                         // died away: the last 300 ms quiet, after the onset
                         if i >= o + 30 && levels[i - 30..].iter().all(|&l| l < QUIET_DB) {
                             (settled, decayed, release) = (true, true, true);
-                        } else if i >= o + stable_blocks + 10 {
-                            // settled: the level over 100 ms stays within STABLE_DB for STABLE_MS
+                        } else if i >= o + stable_blocks + 30 {
+                            // settled: the level over 300 ms (a chorus's or a detuned pad's beating
+                            // averaged out) stays within STABLE_DB for STABLE_MS
                             let smooth = |j: usize| {
-                                let ms = levels[j - 10..j].iter().map(|&l| 10f32.powf(l / 10.0)).sum::<f32>() / 10.0;
+                                let ms = levels[j - 30..j].iter().map(|&l| 10f32.powf(l / 10.0)).sum::<f32>() / 30.0;
                                 db(ms)
                             };
                             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
@@ -368,7 +369,12 @@ fn record(m: &mut Machine, s: &Sampler, spec: &Spec, cancel: &AtomicBool) -> Res
                                 let v = smooth(j);
                                 (lo, hi) = (lo.min(v), hi.max(v));
                             }
-                            if hi - lo <= STABLE_DB && hi > QUIET_DB + 10.0 {
+                            // or it moves (a pulse, a tremolo) but no longer grows or fades: the
+                            // two seconds' halves the same on average
+                            let mean = |r: &[f32]| db(r.iter().map(|&l| 10f32.powf(l / 10.0)).sum::<f32>() / r.len() as f32);
+                            let half = stable_blocks / 2;
+                            let even = (mean(&levels[i - stable_blocks..i - half]) - mean(&levels[i - half..i])).abs() <= 0.75;
+                            if (hi - lo <= STABLE_DB || even) && hi > QUIET_DB + 10.0 {
                                 (settled, release) = (true, true);
                                 settled_from = Some((i - stable_blocks) * block);
                             }
@@ -517,51 +523,56 @@ pub fn find_loop(x: &[f32], from: usize, to: usize, onset: usize, p0: f64, rate:
     // levels of 50 ms blocks (three periods if longer), for how even the level is across a loop
     let block = ((0.05 * rate).max(3.0 * p) as usize).max(1);
     let lv: Vec<f32> = x.chunks(block).map(|b| db(b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32)).collect();
+    // how far the level is from even across a loop: the step at its join, and a trend between its
+    // halves (movement within it, a pad's pulse or a tremolo, is the sound's own)
     let spread = |s: usize, e: usize| {
         let (a, b) = (s / block, (e / block).max(s / block + 1).min(lv.len()));
-        let (lo, hi) = lv[a..b].iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        hi - lo
+        let join = (lv[a] - lv[b - 1]).abs();
+        let m = (a + b) / 2;
+        let mean = |r: &[f32]| if r.is_empty() { 0.0 } else { db(r.iter().map(|&l| 10f32.powf(l / 10.0)).sum::<f32>() / r.len() as f32) };
+        let trend = if b - a >= 4 { (mean(&lv[a..m]) - mean(&lv[m..b])).abs() } else { 0.0 };
+        join + trend
     };
-    let step = (p.round() as usize).max((0.004 * rate) as usize).max(1);
-    let mut lengths: Vec<usize> = (0..16)
-        .map(|k| {
-            let l = lmin * (lmax / lmin).powf(k as f64 / 15.0);
-            ((l / p).round().max(1.0) * p).round() as usize
-        })
-        .filter(|&l| l as f64 <= lmax)
-        .collect();
-    lengths.dedup();
     let r = (p / 2.0).ceil() as usize;
     let reach = ((p / 2.0) as usize).max(1);
     // room past the end for the refinements below to move it
     let margin = h + r + reach + 9;
     let lo_s = from.max(onset + h).max(h) + reach + 1;
+    let hi_s = to.saturating_sub(lmin as usize + margin);
+    if hi_s <= lo_s {
+        return None;
+    }
+    // starts every 25 ms (or period), at most 48 of them; from each, every whole number of periods
+    // as the end, so a long loop can land where a chorus or a beating pad comes round again
+    let step = ((p.round() as usize).max((0.025 * rate) as usize)).max((hi_s - lo_s) / 48).max(1);
     let mut best: Option<(f32, usize, usize)> = None;
     let debug = std::env::var("FM1C_LOOP_DEBUG").is_ok();
-    for &l in &lengths {
-        let mut s = lo_s;
-        let mut low = (f32::MAX, 0usize, 0.0f32);
-        while s + l + margin < to {
-            let err = join_err(x, s, s + l, c);
-            if debug && err < low.0 {
-                low = (err, s, spread(s, s + l));
+    let mut s = lo_s;
+    while s < hi_s {
+        let mut k = (lmin / p).ceil();
+        loop {
+            let l = (k * p).round() as usize;
+            if l as f64 > lmax || s + l + margin >= to {
+                break;
             }
+            let err = join_err(x, s, s + l, c);
             if err < 0.35 {
-                let score = err + spread(s, s + l) / 40.0 - 0.12 * (l as f64 / lmax) as f32
+                let score = err + spread(s, s + l) / 30.0 - 0.2 * (l as f64 / lmax) as f32
                     // later is better: a loop that ends near the note-off leaves the release prompt
                     - 0.05 * ((s + l - from) as f32 / (to - from) as f32);
                 if best.map_or(true, |b| score < b.0) {
                     best = Some((score, s, l));
                 }
             }
-            s += step;
+            k += 1.0;
         }
-        if debug {
-            eprintln!("  L {:7} ({:5.0} ms)  best err {:.3} at {:7}  spread {:4.1} dB", l, l as f64 * 1000.0 / rate, low.0, low.1, low.2);
-        }
+        s += step;
     }
     if debug {
-        eprintln!("  p {p:.2} (p0 {p0:.2}), window {from}..{to}, chose {best:?}");
+        let (sc, bs, bl) = best.unwrap_or((0.0, 0, 0));
+        eprintln!("  p {p:.2} (p0 {p0:.2}), window {from}..{to}: loop {bl} ({:.0} ms) at {bs}, err {:.3}, spread {:.1} dB, score {sc:.3}",
+                  bl as f64 * 1000.0 / rate, if bl > 0 { join_err(x, bs, bs + bl, c) } else { 0.0 },
+                  if bl > 0 { spread(bs, bs + bl) } else { 0.0 });
     }
     let (_, s, l) = best?;
     // the length to the sample, within half a period
@@ -972,10 +983,11 @@ mod tests {
             let said = s.said(p).unwrap();
             println!("program {}: {:?} -> {:?}", p + 1, said, preset_name(&said, true));
         }
+        let program = std::env::var("FM1C_AUTOSAMPLE_PROGRAM").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
         for note in [36u8, 60, 84] {
             let t = std::time::Instant::now();
             let spec = Spec { note, velocity: 127, hold: Hold::UntilSettled(10_000), loop_points: true, max_tail_ms: 10_000 };
-            let smp = s.note(0, &spec, &cancel).unwrap();
+            let smp = s.note(program.clamp(1, n) - 1, &spec, &cancel).unwrap();
             println!("note {note}: {} frames x{} ({:.2} s), off at {:.2} s, settled {} decayed {}, peak {:.3}, loop {:?} ({:.0} ms)",
                      smp.frames, smp.channels, smp.frames as f64 / s.rate, smp.note_off as f64 / s.rate, smp.settled, smp.decayed,
                      smp.peak, smp.lp, t.elapsed().as_secs_f64() * 1000.0);

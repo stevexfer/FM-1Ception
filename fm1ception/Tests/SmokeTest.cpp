@@ -24,6 +24,7 @@
 #include "CloudCatalog.h"
 #include "FirmwareLibrary.h"
 #include "LibraryWindow.h"
+#include "AutoSampler.h"
 
 using namespace fm1c;
 
@@ -585,6 +586,49 @@ int libraryShot (const juce::File& support, const juce::File& png, const juce::S
 }
 } // namespace
 
+/** --autosample DIR FIRMWARE [LAST]: the AutoSample window's defaults on FIRMWARE into DIR (programs
+    1..LAST if given), the window as DIR/window.png with the programs listed, and what was written. */
+int autoSample (const juce::File& dir, const juce::File& fw, int last)
+{
+    FM1CeptionProcessor p;
+    p.prepareToPlay (kSr, kBlock);
+    if (p.loadFileNow (0, fw).failed())
+        return 1;
+    render (p, 3.0);
+    fm1c::AutoSampleView view (p.engine (0), p.engine (0)->firmwareName(), 1);
+    auto s = view.settings();
+    s.programs = last > 1;
+    s.lastProgram = last;
+    s.parent = dir;
+    const auto t0 = juce::Time::getMillisecondCounterHiRes();
+    fm1c::AutoSampler a (p.engine (0), s, p.engine (0)->firmwareName());
+    using Stage = fm1c::AutoSampler::Stage;
+    auto settle = [&a]
+    {
+        while (a.status().stage == Stage::starting || a.status().stage == Stage::scouting || a.status().stage == Stage::capturing)
+            juce::Thread::sleep (100);
+        return a.status();
+    };
+    auto st = settle();
+    if (st.stage == Stage::listed)
+    {
+        for (const auto& pr : a.programs())
+            std::cout << "  " << pr.name << "   <- " << pr.said << std::endl;
+        std::cout << "  listed in " << (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0 << " s" << std::endl;
+        a.capture (a.programs());
+        st = settle();
+    }
+    std::cout << "  " << st.text << " in " << (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0 << " s: "
+              << st.folder.getFullPathName() << std::endl;
+    view.setSize (680, 560);
+    juce::PNGImageFormat png;
+    juce::FileOutputStream out (dir.getChildFile ("window.png"));
+    out.setPosition (0);
+    out.truncate();
+    png.writeImageToStream (view.createComponentSnapshot (view.getLocalBounds(), true, 2.0f), out);
+    return st.stage == Stage::done ? 0 : 1;
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
@@ -610,6 +654,9 @@ int main (int argc, char** argv)
             fws.add (juce::File (juce::String::fromUTF8 (argv[i])));
         return siteShots (juce::File (juce::String::fromUTF8 (argv[2])), fws);
     }
+    if (argc > 3 && juce::String (argv[1]) == "--autosample")
+        return autoSample (juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])),
+                           argc > 4 ? juce::String (argv[4]).getIntValue() : 1);
     if (argc > 2 && juce::String (argv[1]) == "--snapshot")
         return snapshots (juce::File (juce::String::fromUTF8 (argv[2])), findFirmware (argc - 2, argv + 2));
 
@@ -2081,6 +2128,90 @@ int main (int argc, char** argv)
                 pk = play (p, 3, 2.5);
                 check (pk[0] < 1.0e-4f && pk[1] < 1.0e-4f, "MultiChannel: Ch 3 plays neither");
             }
+        }
+        {
+            std::cout << "  AutoSample" << std::endl;
+            FM1CeptionProcessor p;
+            p.prepareToPlay (kSr, kBlock);
+            check (p.loadFileNow (0, fw).wasOk(), "AutoSample: the firmware loads");
+            render (p, 3.0);
+            const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getNonexistentChildFile ("fm1c-autosample", "");
+            fm1c::AutoSampleSettings s;
+            s.root = 36;
+            s.top = 72;
+            s.span = 12;
+            s.hold = 5; // a quarter note
+            s.tempo = 120.0;
+            s.name = "Smoke";
+            s.parent = dir;
+            check (s.notes() == juce::Array<int> ({ 36, 48, 60, 72 }) && s.holdMs() == 500, "AutoSample: C1..C4 every octave, 500 ms");
+            s.span = 7;
+            check (s.notes().getLast() == 72 && s.notes().size() == 7, "AutoSample: Top is sampled even off the span");
+            s.span = 12;
+            const auto t0 = juce::Time::getMillisecondCounterHiRes();
+            auto wait = [] (fm1c::AutoSampler& a)
+            {
+                using Stage = fm1c::AutoSampler::Stage;
+                for (int i = 0; i < 1200; ++i)
+                {
+                    const auto st = a.status().stage;
+                    if (st == Stage::done || st == Stage::failed || st == Stage::cancelled || st == Stage::listed)
+                        break;
+                    juce::Thread::sleep (100);
+                }
+                return a.status();
+            };
+            {
+                fm1c::AutoSampler a (p.engine (0), s, p.engine (0)->firmwareName());
+                const auto st = wait (a);
+                check (st.stage == fm1c::AutoSampler::Stage::done && st.written == 1,
+                       "AutoSample: four notes rendered and written (" + st.text + ", "
+                           + juce::String ((juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0, 1) + " s)");
+                const auto sfz = dir.getChildFile ("Smoke/Smoke.sfz").loadFileAsString();
+                juce::StringArray lines;
+                lines.addLines (sfz);
+                juce::StringArray regions;
+                for (const auto& l : lines)
+                    if (l.startsWith ("<region>"))
+                        regions.add (l);
+                check (regions.size() == 4 && regions[0].contains ("lokey=0 hikey=41") && regions[3].contains ("lokey=66 hikey=127")
+                           && sfz.contains ("default_path=Smoke Samples/"),
+                       "AutoSample: one line a region, zones centred, the ends to 0 and 127");
+                juce::AudioFormatManager fm;
+                fm.registerBasicFormats();
+                float peak = 0.0f;
+                bool rates = true;
+                for (int n : { 36, 48, 60, 72 })
+                {
+                    const auto f = dir.getChildFile ("Smoke/Smoke Samples/Smoke " + fm1c::AutoSampleSettings::noteName (n) + ".flac");
+                    std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (f));
+                    if (r == nullptr)
+                    {
+                        rates = false;
+                        continue;
+                    }
+                    rates &= (int) r->sampleRate == 44100 && r->bitsPerSample == 24 && r->lengthInSamples > 1000;
+                    juce::Range<float> ranges[2];
+                    r->readMaxLevels (0, r->lengthInSamples, ranges, (int) juce::jmin (2u, r->numChannels));
+                    for (unsigned c = 0; c < juce::jmin (2u, r->numChannels); ++c)
+                        peak = juce::jmax (peak, std::abs (ranges[c].getStart()), std::abs (ranges[c].getEnd()));
+                }
+                check (rates, "AutoSample: 24-bit FLAC at 44.1 kHz");
+                check (std::abs (juce::Decibels::gainToDecibels (peak) + 1.0f) < 0.1f,
+                       "AutoSample: normalised together to -1 dB (" + juce::String (juce::Decibels::gainToDecibels (peak), 2) + " dB)");
+            }
+            {
+                auto c = s;
+                c.hold = 0;
+                fm1c::AutoSampler a (p.engine (0), c, p.engine (0)->firmwareName());
+                juce::Thread::sleep (300);
+                a.cancel();
+                const auto st = wait (a);
+                check (st.stage == fm1c::AutoSampler::Stage::cancelled || st.stage == fm1c::AutoSampler::Stage::failed,
+                       "AutoSample: a run cancels");
+            }
+            check (render (p, 2.0, 0.5).peak > 1.0e-3f, "AutoSample: the engine plays on");
+            dir.deleteRecursively();
         }
     }
 

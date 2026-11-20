@@ -187,6 +187,10 @@ set(FM1C_SOURCES
     Source/LibraryWindow.cpp
     Source/OutputMeter.h
     Source/OutputMeter.cpp
+    Source/AutoSampler.h
+    Source/AutoSampler.cpp
+    Source/AutoSampleWindow.h
+    Source/AutoSampleWindow.cpp
     Source/Theme.h
 )
 source_group("Plugin" FILES ${FM1C_SOURCES})
@@ -312,6 +316,8 @@ if(FM1C_BUILD_TESTS)
         Source/ScreenCache.cpp
         Source/LibraryWindow.cpp
         Source/OutputMeter.cpp
+        Source/AutoSampler.cpp
+        Source/AutoSampleWindow.cpp
     )
     target_include_directories(FM1CeptionTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Source)
     target_compile_definitions(FM1CeptionTests PUBLIC
