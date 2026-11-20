@@ -21,6 +21,7 @@ mod savefile;
 #[path = "../../../crates/fm1-live/src/wav.rs"]
 #[allow(dead_code)]
 mod wav;
+mod autosample;
 
 use engine::{Cmd, Midi, Shared, View};
 

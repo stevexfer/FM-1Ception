@@ -100,12 +100,12 @@ pub struct Shared {
     pub quit: AtomicBool,
 }
 
-struct Machine {
+pub(crate) struct Machine {
     cpu: Cpu,
     cpu1: Option<Cpu>,
-    soc: Soc,
+    pub(crate) soc: Soc,
     pending_tick: bool,
-    halted: bool,
+    pub(crate) halted: bool,
     /// the flash as booted, to find the sectors the firmware has written since
     flash0: Vec<u8>,
 }
@@ -113,7 +113,7 @@ struct Machine {
 impl Machine {
     /// `lcd_timed`: the LCD's transfers take their time, as on an FM-1 (fm1_soc's `Soc::lcd_timed`).
     /// `frame_ns`: `Some(FRAME_NS_48)` for an ORBIT-family 48 kHz firmware; `None` for stock 44.1 kHz.
-    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64, lcd_timed: bool, frame_ns: Option<u64>) -> Result<Self, String> {
+    pub(crate) fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64, lcd_timed: bool, frame_ns: Option<u64>) -> Result<Self, String> {
         crate::savefile::validate_sectors(&sectors.iter().map(|(at, data)| crate::Sector {
             at: *at, data: Arc::new(data.clone()),
         }).collect::<Vec<_>>())?;
@@ -137,7 +137,7 @@ impl Machine {
     }
 
     /// fm1-live's loop: cpu0's blocks, cpu1 beside once the firmware releases it.
-    fn run(&mut self, n: u32) {
+    pub(crate) fn run(&mut self, n: u32) {
         let jit = self.cpu.jit_on;
         let Machine { cpu, cpu1, soc, pending_tick, .. } = self;
         if machine::run_dual(cpu1, soc, n, RAM_SIZE, jit, |soc, k| machine::run_blocks(cpu, soc, k, pending_tick)).is_err() {
@@ -147,7 +147,7 @@ impl Machine {
 
     /// The machine as a save-state against a fresh boot of the package with the flash written so
     /// far (which goes with it).
-    fn save_state(&self, pkg: &[u8]) -> Result<(Sectors, Vec<u8>), String> {
+    pub(crate) fn save_state(&self, pkg: &[u8]) -> Result<(Sectors, Vec<u8>), String> {
         if self.halted {
             return Err("the firmware has stopped".into());
         }
@@ -158,7 +158,7 @@ impl Machine {
     }
 
     /// The machine a save-state was taken of, from the package and flash it was saved with.
-    fn restore(pkg: &[u8], sectors: &[(u32, Vec<u8>)], state: &[u8], frame_ns: Option<u64>) -> Result<Self, String> {
+    pub(crate) fn restore(pkg: &[u8], sectors: &[(u32, Vec<u8>)], state: &[u8], frame_ns: Option<u64>) -> Result<Self, String> {
         let hz = fm1_soc::state::clock_hz(state).ok_or("not a machine state")?;
         let fresh = Machine::boot(pkg, sectors, hz / 1_000_000, fm1_soc::lcd_timed_from_env(), frame_ns)?;
         let mut m = fm1_soc::state::restore(state, fresh.soc)?;

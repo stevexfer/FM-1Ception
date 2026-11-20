@@ -108,6 +108,62 @@ bool fm1e_push_midi (const Fm1e*, uint64_t frame, uint8_t b0, uint8_t b1, uint8_
 bool fm1e_pop (const Fm1e*, float* lr);
 void fm1e_starved (const Fm1e*, uint64_t frames);
 
+/* AutoSample (engine/src/autosample.rs): an engine's sound as samples, rendered from a copy of its
+   machine on the caller's threads, flat out and silent; the engine plays on untouched. Every call
+   but fm1e_sampler_rate/_quiet/_scouted/_programs/_said blocks: call them off the message and audio
+   threads. msg: why a call failed (NUL-terminated, cut to fit; may be null). A cancel flag is a
+   std::atomic<bool> (null: none). */
+typedef struct Fm1eSampler Fm1eSampler;
+typedef struct Fm1eSample Fm1eSample;
+
+typedef struct Fm1eSampleSpec
+{
+    uint8_t note, velocity;
+    uint8_t loopPoints;     /* look for a loop in the sustain */
+    uint32_t holdMs;        /* 0: until the level settles (2 s steady) or dies away, at most maxHoldMs */
+    uint32_t maxHoldMs;
+    uint32_t maxTailMs;     /* the release recorded after the note-off, at most */
+} Fm1eSampleSpec;
+
+typedef struct Fm1eSampleInfo
+{
+    uint64_t frames;        /* from the note's onset to its end */
+    uint32_t channels;      /* 1 if left and right were the same throughout */
+    uint8_t silent;         /* the note made no sound: no frames */
+    uint8_t settled;        /* its level settled (or it died away) before the hold ran out */
+    uint8_t decayed;        /* it died away while held */
+    uint8_t hasLoop;
+    uint64_t loopStart, loopEnd;   /* loopEnd: the frame after the loop's last */
+    uint64_t crossfade;            /* frames */
+    uint64_t noteOff;
+    float peak;
+} Fm1eSampleInfo;
+
+/* from the engine's machine as it is now (All Notes Off, then quiet); notes on MIDI channel 1..16 */
+Fm1eSampler* fm1e_sampler_create (const Fm1e*, uint8_t channel, char* msg, size_t msgCap);
+void fm1e_sampler_destroy (Fm1eSampler*);
+/* the samples' rate: the firmware's codec (44100, or 48076.9 for an ORBIT-family 48 kHz one) */
+double fm1e_sampler_rate (const Fm1eSampler*);
+/* whether the copy fell quiet with no note held (else something plays by itself: a sequencer?) */
+bool fm1e_sampler_quiet (const Fm1eSampler*);
+/* programs first..last (1: the engine's own; each next one a click of PRESETS), named by what the
+   firmware's screen reader says, if it has one. Stops early where a click changes nothing or comes
+   round to program 1. Returns how many (then 0-based below), or -1 */
+int fm1e_sampler_scout (const Fm1eSampler*, uint32_t first, uint32_t last, const void* cancel,
+                        char* msg, size_t msgCap);
+uint32_t fm1e_sampler_scouted (const Fm1eSampler*);
+uint32_t fm1e_sampler_programs (const Fm1eSampler*);
+/* what the reader said at program i (ASCII, not terminated; empty: nothing); returns its length */
+size_t fm1e_sampler_said (const Fm1eSampler*, uint32_t i, uint8_t* out, size_t cap);
+/* a name from what the reader said; strip: a preset number before it goes ("P02 Warm Pad" -> "Warm Pad") */
+size_t fm1e_preset_name (const char* said, bool strip, uint8_t* out, size_t cap);
+/* one note of program `program`; several may run at once. Null on failure or cancel */
+Fm1eSample* fm1e_sampler_note (const Fm1eSampler*, uint32_t program, const Fm1eSampleSpec*, const void* cancel,
+                               Fm1eSampleInfo* info, char* msg, size_t msgCap);
+/* info.frames * info.channels floats, interleaved */
+const float* fm1e_sample_data (const Fm1eSample*);
+void fm1e_sample_free (Fm1eSample*);
+
 #ifdef __cplusplus
 }
 #endif
