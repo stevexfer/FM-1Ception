@@ -62,7 +62,7 @@ juce::File AutoSampleSettings::serumFolder()
     const auto presets = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                              .getChildFile ("Xfer").getChildFile ("Serum 2 Presets");
    #endif
-    return presets.getChildFile ("Multisamples").getChildFile ("User");
+    return presets.getChildFile ("Multisamples").getChildFile ("FM-1");
 }
 
 static juce::File settingsFile()

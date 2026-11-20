@@ -9,8 +9,8 @@ namespace fm1c
 // held (Duration at Tempo), Velocity, loops, the programs, the name. Start takes
 // the engine as it is now; with Capture Multiple Programs it lists the programs
 // the PRESETS knob reaches, named by the firmware's screen reader where it has
-// one, to untick or rename before Capture. The run goes to Serum 2's User
-// Multisamples folder (AutoSampler).
+// one, to untick or rename before Capture. The run goes to Serum 2's
+// Multisamples/FM-1 folder (AutoSampler).
 //==============================================================================
 class AutoSampleView : public juce::Component,
                        private juce::TableListBoxModel,

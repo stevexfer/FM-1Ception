@@ -12,7 +12,8 @@ namespace fm1c
 // Each program is one SFZ: its samples normalised together to -1 dB peak, as 24-bit
 // FLAC at the firmware's own rate, mono where left and right are the same, each
 // sample's zone centred on it, one line per region. A run goes in a folder of its
-// own in Serum 2's User Multisamples folder.
+// own in Serum 2's Multisamples/FM-1 (macOS: /Library/Audio/Presets/Xfer Records/Serum 2
+// Presets; Windows: Documents\Xfer\Serum 2 Presets).
 //==============================================================================
 struct AutoSampleSettings
 {
