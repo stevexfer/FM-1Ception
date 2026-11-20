@@ -159,6 +159,19 @@ void AutoSampler::set (Stage stage, double progress, const juce::String& text)
     state.text = text;
 }
 
+void AutoSampler::report (const juce::String& line)
+{
+    const juce::ScopedLock sl (lock);
+    lines.add (line);
+    state.logLines = lines.size();
+}
+
+juce::StringArray AutoSampler::log() const
+{
+    const juce::ScopedLock sl (lock);
+    return lines;
+}
+
 juce::String AutoSampler::fileSafe (const juce::String& s)
 {
     auto t = s.replaceCharacters ("/\\:*?\"<>|", "---------").removeCharacters ("\r\n\t").trim();
@@ -179,6 +192,15 @@ void AutoSampler::run()
         return set (Stage::cancelled, 0.0, "Cancelled");
 
     const bool quiet = fm1e_sampler_quiet (sampler);
+    {
+        juce::StringArray names;
+        for (int n : settings.notes())
+            names.add (AutoSampleSettings::noteName (n));
+        report (firmware + ": " + names.joinIntoString (" ") + " at velocity " + juce::String (settings.velocity)
+                + ", MIDI channel " + juce::String (settings.channel));
+    }
+    if (! quiet)
+        report ("Something plays with no note held (a sequencer?): it will be in the samples");
     if (settings.programs)
     {
         const int first = juce::jlimit (1, 127, settings.firstProgram), last = juce::jlimit (first, 127, settings.lastProgram);
@@ -187,7 +209,12 @@ void AutoSampler::run()
         if (cancelled)
             return set (Stage::cancelled, 0.0, "Cancelled");
         if (n < 0)
+        {
+            report (juce::String ("Could not step through the programs: ") + juce::String (msg));
             return set (Stage::failed, 0.0, juce::String ("Could not step through the programs: ") + juce::String (msg));
+        }
+        report ("The PRESETS knob reached " + juce::String (n) + (n == 1 ? " program" : " programs")
+                + (n < last - first + 1 ? " (it went no further, or came round to the first)" : juce::String()));
     }
 
     std::vector<Program> list;
@@ -211,8 +238,8 @@ void AutoSampler::run()
 
     if (settings.programs)
     {
-        set (Stage::listed, 1.0, juce::String ((int) list.size()) + (list.size() == 1 ? " program" : " programs") + " found"
-                                     + (quiet ? "" : ". Something plays with no note held (a sequencer?): it will be in the samples"));
+        set (Stage::listed, 1.0, juce::String ((int) list.size()) + (list.size() == 1 ? " program" : " programs")
+                                     + " found: untick or rename, then Capture");
         while (! cancelled)
         {
             go.wait (200);
@@ -242,31 +269,63 @@ bool AutoSampler::capturePrograms()
         return false;
     }
 
-    int todo = 0, written = 0;
+    int todo = 0, written = 0, silentRun = 0, skipped = 0, done = 0;
     for (const auto& p : progs)
         todo += p.include ? 1 : 0;
-    juce::StringArray skipped, names;
+    juce::StringArray names;
     std::vector<Note> previous;
-    int done = 0;
+    const auto notesList = settings.notes();
+    // the note that tells a silent program: the middle one
+    const int probe = notesList.size() / 2;
+    const auto probeName = AutoSampleSettings::noteName (notesList[probe]);
     for (size_t i = 0; i < progs.size(); ++i)
     {
         if (! progs[i].include)
             continue;
-        std::vector<Note> notes;
-        const auto label = progs.size() > 1 ? progs[i].name : base;
-        set (Stage::capturing, (double) done / juce::jmax (1, todo),
-             "Capturing " + (label.isEmpty() ? juce::String ("program ") + juce::String ((int) i + 1) : label) + "...");
-        if (! renderProgram ((int) i, notes))
+        const auto label = progs.size() > 1 ? (progs[i].name.isNotEmpty() ? progs[i].name : juce::String ((int) i + 1)) : base;
+        const auto number = progs.size() > 1 ? juce::String (settings.firstProgram + (int) i).paddedLeft ('0', 3) + "  " : juce::String();
+        set (Stage::capturing, (double) done / juce::jmax (1, todo), "Capturing " + label + "...");
+
+        std::vector<Note> notes ((size_t) notesList.size());
+        for (int k = 0; k < notesList.size(); ++k)
+            notes[(size_t) k].note = notesList[k];
+        const bool ok = renderProgram ((int) i, notes, probe) && (notes[(size_t) probe].info.silent || renderProgram ((int) i, notes));
+        if (! ok)
         {
             if (! cancelled)
                 return false;
             folder.deleteRecursively (true);
+            report ("Cancelled");
             set (Stage::cancelled, 0.0, "Cancelled");
             return false;
         }
         ++done;
 
-        const bool silent = std::all_of (notes.begin(), notes.end(), [] (const Note& n) { return n.info.silent != 0; });
+        if (notes[(size_t) probe].info.silent)
+        {
+            ++skipped;
+            report (number + label + ": silent (" + probeName + " made no sound), skipped");
+            if (written == 0 && ++silentRun >= kSilentStop)
+            {
+                folder.deleteRecursively (true);
+                const auto why = juce::String (silentRun) + " programs in a row made no sound, so the run stopped. Does this firmware play "
+                               + "MIDI notes on channel " + juce::String (settings.channel) + "? Try a note from your keyboard on this engine.";
+                report (why);
+                set (Stage::failed, 0.0, why);
+                return false;
+            }
+            if (progs.size() == 1)
+            {
+                folder.deleteRecursively (true);
+                const auto why = probeName + " on MIDI channel " + juce::String (settings.channel)
+                               + " made no sound: nothing written. Does this firmware play MIDI notes on that channel?";
+                set (Stage::failed, 0.0, why);
+                return false;
+            }
+            continue;
+        }
+        silentRun = 0;
+
         auto same = [&previous] (const std::vector<Note>& now)
         {
             if (previous.size() != now.size())
@@ -282,23 +341,36 @@ bool AutoSampler::capturePrograms()
             }
             return true;
         };
-        if (silent || (progs.size() > 1 && same (notes)))
+        if (progs.size() > 1 && same (notes))
         {
-            skipped.add (progs[i].name + (silent ? " (silent)" : " (the same as the one before)"));
+            ++skipped;
+            report (number + label + ": the same as the one before, skipped");
             continue;
         }
 
-        auto file = progs.size() > 1 ? fileSafe (progs[i].name.isNotEmpty() ? progs[i].name : juce::String ((int) i + 1)) : base;
+        auto file = progs.size() > 1 ? fileSafe (label) : base;
         for (int k = 2; names.contains (file, true); ++k)
-            file = fileSafe (progs[i].name) + " " + juce::String (k);
+            file = fileSafe (label) + " " + juce::String (k);
         names.add (file);
         const auto error = writeProgram (folder, file, progs[i], notes, rate);
         if (error.isNotEmpty())
         {
+            report (error);
             set (Stage::failed, 0.0, error);
             return false;
         }
         ++written;
+        int sounded = 0, looped = 0, capped = 0;
+        for (const auto& n : notes)
+        {
+            sounded += n.info.silent ? 0 : 1;
+            looped += n.info.hasLoop ? 1 : 0;
+            capped += ! n.info.silent && ! n.info.settled ? 1 : 0;
+        }
+        report (number + label + ": written, " + juce::String (sounded) + " notes, " + juce::String (looped) + " looped"
+                + (capped > 0 ? ", " + juce::String (capped) + " never settled (held "
+                                    + juce::String ((int) AutoSampleSettings::kMaxHoldMs / 1000) + " s)" : juce::String())
+                + (sounded < (int) notes.size() ? ", " + juce::String ((int) notes.size() - sounded) + " silent" : juce::String()));
         previous = std::move (notes);
     }
 
@@ -308,18 +380,22 @@ bool AutoSampler::capturePrograms()
     state.folder = folder;
     state.written = written;
     state.text = juce::String (written) + (written == 1 ? " SFZ" : " SFZs") + " written"
-               + (skipped.isEmpty() ? juce::String() : ", skipped: " + skipped.joinIntoString (", "));
+               + (skipped == 0 ? juce::String() : ", " + juce::String (skipped) + " skipped");
     if (written == 0)
         folder.deleteRecursively (true);
+    lines.add (state.text);
+    state.logLines = lines.size();
     return true;
 }
 
-bool AutoSampler::renderProgram (int program, std::vector<Note>& notes)
+bool AutoSampler::renderProgram (int program, std::vector<Note>& notes, int only)
 {
-    const auto list = settings.notes();
-    notes.assign ((size_t) list.size(), {});
-    for (int k = 0; k < list.size(); ++k)
-        notes[(size_t) k].note = list[k];
+    std::vector<int> todo;
+    for (int k = 0; k < (int) notes.size(); ++k)
+        if (! notes[(size_t) k].rendered && (only < 0 || k == only))
+            todo.push_back (k);
+    if (todo.empty())
+        return true;
 
     Fm1eSampleSpec spec {};
     spec.velocity = (juce::uint8) juce::jlimit (1, 127, settings.velocity);
@@ -333,11 +409,12 @@ bool AutoSampler::renderProgram (int program, std::vector<Note>& notes)
     juce::String error;
     juce::CriticalSection errorLock;
     const double base = juce::jmax (0.0, status().progress);
+    const int total = (int) notes.size();
     auto work = [&]
     {
-        for (int k; ! failed && ! cancelled && (k = next++) < (int) notes.size();)
+        for (int t; ! failed && ! cancelled && (t = next++) < (int) todo.size();)
         {
-            auto& n = notes[(size_t) k];
+            auto& n = notes[(size_t) todo[(size_t) t]];
             auto s = spec;
             s.note = (juce::uint8) n.note;
             char msg[512] = {};
@@ -351,30 +428,32 @@ bool AutoSampler::renderProgram (int program, std::vector<Note>& notes)
             }
             const auto* d = fm1e_sample_data (smp);
             n.data.assign (d, d + n.info.frames * n.info.channels);
+            n.rendered = true;
             fm1e_sample_free (smp);
             ++finished;
         }
     };
     const int threads = juce::jlimit (1, 8, (int) std::thread::hardware_concurrency() - 2);
     std::vector<std::thread> pool;
-    for (int t = 0; t < juce::jmin (threads, (int) notes.size()); ++t)
+    for (int t = 0; t < juce::jmin (threads, (int) todo.size()); ++t)
         pool.emplace_back (work);
     for (bool running = true; running;)
     {
-        running = false;
         juce::Thread::sleep (100);
-        if (finished < (int) notes.size() && ! failed && ! cancelled)
-            running = true;
+        running = finished < (int) todo.size() && ! failed && ! cancelled;
         const juce::ScopedLock sl (lock);
-        const auto todo = juce::jmax (1, (int) found.size());
-        state.progress = juce::jmin (1.0, base + (double) finished / (double) notes.size() / todo);
-        if (! running)
-            break;
+        int programsToDo = 0;
+        for (const auto& p : found)
+            programsToDo += p.include ? 1 : 0;
+        state.progress = juce::jmin (1.0, base + (double) finished / (double) total / juce::jmax (1, programsToDo));
     }
     for (auto& t : pool)
         t.join();
     if (failed && ! cancelled)
+    {
+        report ("Could not render " + error);
         set (Stage::failed, 0.0, "Could not render " + error);
+    }
     return ! failed && ! cancelled;
 }
 

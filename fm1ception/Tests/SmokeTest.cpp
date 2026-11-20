@@ -601,26 +601,34 @@ int autoSample (const juce::File& dir, const juce::File& fw, int last)
     s.lastProgram = last;
     s.parent = dir;
     const auto t0 = juce::Time::getMillisecondCounterHiRes();
-    fm1c::AutoSampler a (p.engine (0), s, p.engine (0)->firmwareName());
+    view.startWith (s);
+    auto& a = *view.sampler();
     using Stage = fm1c::AutoSampler::Stage;
-    auto settle = [&a]
+    int printed = 0;
+    auto settle = [&]
     {
-        while (a.status().stage == Stage::starting || a.status().stage == Stage::scouting || a.status().stage == Stage::capturing)
+        for (;;)
+        {
             juce::Thread::sleep (100);
-        return a.status();
+            view.poll();
+            const auto log = a.log();
+            for (; printed < log.size(); ++printed)
+                std::cout << "  | " << log[printed] << std::endl;
+            const auto st = a.status().stage;
+            if (st != Stage::starting && st != Stage::scouting && st != Stage::capturing)
+                return a.status();
+        }
     };
     auto st = settle();
     if (st.stage == Stage::listed)
     {
-        for (const auto& pr : a.programs())
-            std::cout << "  " << pr.name << "   <- " << pr.said << std::endl;
         std::cout << "  listed in " << (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0 << " s" << std::endl;
         a.capture (a.programs());
         st = settle();
     }
     std::cout << "  " << st.text << " in " << (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0 << " s: "
               << st.folder.getFullPathName() << std::endl;
-    view.setSize (680, 560);
+    view.setSize (720, 700);
     juce::PNGImageFormat png;
     juce::FileOutputStream out (dir.getChildFile ("window.png"));
     out.setPosition (0);

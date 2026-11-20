@@ -63,6 +63,7 @@ public:
         juce::String text;
         juce::File folder;        // done: where the run went
         int written = 0;          // done: programs written
+        int logLines = 0;         // how many lines log() has
     };
 
     /** Starts at once: takes the engine's machine, then (with Multiple Programs) finds the
@@ -76,6 +77,11 @@ public:
     /** At Stage::listed: capture these (the same order as programs(), names as edited). */
     void capture (std::vector<Program>);
     void cancel();
+    /** What happened, a line a step (each program written or skipped, and why). */
+    juce::StringArray log() const;
+
+    /** A run stops when this many programs in a row from the start make no sound. */
+    static constexpr int kSilentStop = 4;
 
     /** A name made safe for a file. */
     static juce::String fileSafe (const juce::String&);
@@ -86,14 +92,17 @@ private:
         int note = 0;
         Fm1eSampleInfo info {};
         std::vector<float> data;
+        bool rendered = false;
     };
 
     void run() override;
     bool capturePrograms();
-    bool renderProgram (int program, std::vector<Note>&);
+    /** The notes not yet rendered (all of them, or only `only`). */
+    bool renderProgram (int program, std::vector<Note>&, int only = -1);
     juce::String writeProgram (const juce::File& folder, const juce::String& base, const Program&,
                                std::vector<Note>&, double rate);
     void set (Stage, double progress, const juce::String& text);
+    void report (const juce::String&);
 
     std::shared_ptr<EngineHandle> engine;
     const AutoSampleSettings settings;
@@ -105,6 +114,7 @@ private:
     mutable juce::CriticalSection lock;
     Status state;
     std::vector<Program> found;
+    juce::StringArray lines;
 
     JUCE_DECLARE_NON_COPYABLE (AutoSampler)
 };

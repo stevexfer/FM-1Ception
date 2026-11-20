@@ -123,6 +123,17 @@ AutoSampleView::AutoSampleView (std::shared_ptr<EngineHandle> h, juce::String fw
     hd.addColumn ("WHAT THE FIRMWARE SAID", colSaid, 360, 80, 2000, juce::TableHeaderComponent::notSortable);
     addChildComponent (list);
 
+    console.setMultiLine (true, true);
+    console.setReadOnly (true);
+    console.setCaretVisible (false);
+    console.setScrollbarsShown (true);
+    console.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 12.0f, juce::Font::plain)));
+    console.setColour (juce::TextEditor::backgroundColourId, theme::header);
+    console.setColour (juce::TextEditor::textColourId, theme::silk);
+    console.setColour (juce::TextEditor::outlineColourId, theme::tray);
+    console.setColour (juce::TextEditor::focusedOutlineColourId, theme::tray);
+    addAndMakeVisible (console);
+
     startButton.onClick = [this]
     {
         if (job != nullptr && job->status().stage == AutoSampler::Stage::listed)
@@ -146,7 +157,7 @@ AutoSampleView::AutoSampleView (std::shared_ptr<EngineHandle> h, juce::String fw
     addChildComponent (revealButton);
 
     updateSummary();
-    setSize (680, 560);
+    setSize (720, 700);
 }
 
 AutoSampleView::~AutoSampleView()
@@ -260,6 +271,8 @@ void AutoSampleView::resized()
     cancelButton.setBounds (buttons.removeFromRight (100));
     revealButton.setBounds (buttons.removeFromLeft (150));
     r.removeFromBottom (10);
+    console.setBounds (r.removeFromBottom (8 * 15 + 10));   // eight lines
+    r.removeFromBottom (8);
     auto st = r.removeFromBottom (44);
     bar.setBounds (st.removeFromTop (16));
     statusText.setBounds (st.withTrimmedTop (4));
@@ -271,7 +284,14 @@ void AutoSampleView::start()
 {
     const auto s = settings();
     s.save();
+    startWith (s);
+}
+
+void AutoSampleView::startWith (const AutoSampleSettings& s)
+{
     rows.clear();
+    console.clear();
+    consoleLines = 0;
     list.updateContent();
     list.setVisible (false);
     listShown = false;
@@ -306,6 +326,17 @@ void AutoSampleView::timerCallback()
     progress = st.progress;
     statusText.setText (st.text, juce::dontSendNotification);
     statusText.setColour (juce::Label::textColourId, st.stage == Stage::failed ? theme::warn : theme::silk);
+    if (st.logLines != consoleLines)
+    {
+        const auto lines = job->log();
+        for (int k = consoleLines; k < lines.size(); ++k)
+        {
+            console.moveCaretToEnd();
+            console.insertTextAtCaret ((k > 0 ? "\n" : "") + lines[k]);
+        }
+        consoleLines = lines.size();
+        console.moveCaretToEnd();
+    }
 
     if (st.stage == Stage::listed && ! listShown)
     {
@@ -413,7 +444,7 @@ AutoSampleWindow::AutoSampleWindow (std::shared_ptr<EngineHandle> h, const juce:
     setUsingNativeTitleBar (true);
     setContentOwned (new AutoSampleView (std::move (h), fw, channel), true);
     setResizable (true, false);
-    setResizeLimits (620, 480, 4000, 3000);
+    setResizeLimits (640, 600, 4000, 3000);
     centreWithSize (getWidth(), getHeight());
     setVisible (true);
     toFront (true);

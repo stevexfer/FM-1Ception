@@ -27,6 +27,9 @@ public:
     AutoSampleSettings settings() const;
     AutoSampler* sampler() { return job.get(); }
     void start();
+    void startWith (const AutoSampleSettings&);
+    /** What the timer does: the run's state into the window. */
+    void poll() { timerCallback(); }
 
 private:
     int getNumRows() override;
@@ -57,6 +60,8 @@ private:
     double progress = 0.0;
     juce::ProgressBar bar { progress };
     juce::TableListBox list;
+    juce::TextEditor console;   // the run's log, a line a step
+    int consoleLines = 0;
     juce::TextButton startButton { "Start" }, cancelButton { "Cancel" }, revealButton;
 
     std::unique_ptr<AutoSampler> job;
