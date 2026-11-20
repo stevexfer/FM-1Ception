@@ -56,8 +56,13 @@ juce::String AutoSampleSettings::noteName (int note)
 
 juce::File AutoSampleSettings::serumFolder()
 {
-    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
-        .getChildFile ("Xfer").getChildFile ("Serum 2 Presets").getChildFile ("Multisamples").getChildFile ("User");
+   #if JUCE_MAC
+    const juce::File presets ("/Library/Audio/Presets/Xfer Records/Serum 2 Presets");
+   #else
+    const auto presets = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                             .getChildFile ("Xfer").getChildFile ("Serum 2 Presets");
+   #endif
+    return presets.getChildFile ("Multisamples").getChildFile ("User");
 }
 
 static juce::File settingsFile()

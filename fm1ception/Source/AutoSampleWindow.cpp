@@ -199,7 +199,7 @@ void AutoSampleView::updateSummary()
                                            + juce::String ((int) AutoSampleSettings::kMaxHoldMs / 1000) + " s)"
                                      : juce::String ((int) ms) + " ms")
               + ", then its release until quiet, on MIDI channel " + juce::String (channel) + "."
-              + "\nTo Serum 2 Presets / Multisamples / User / " + AutoSampler::fileSafe (s.name);
+              + "\nTo " + AutoSampleSettings::serumFolder().getChildFile (AutoSampler::fileSafe (s.name)).getFullPathName();
     summary.setText (text, juce::dontSendNotification);
     tempo.setEnabled (ms != 0);
     for (auto* c : { &firstProgram, &lastProgram })
