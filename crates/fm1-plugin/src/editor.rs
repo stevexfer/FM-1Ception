@@ -4,7 +4,7 @@
 //! that is the host's "Master" parameter), and a bar to load a firmware package.
 
 use crate::engine::Cmd;
-use crate::{panel, panel_smk, Clock, Fm1Params, Lead, Link};
+use crate::{panel, panel_smk, AudioRate, Clock, Fm1Params, Lead, Link};
 use fm1_soc::Board;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
@@ -123,6 +123,8 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 bar.label("CPU clock").on_hover_text("The emulated FM-1's clock, 240 MHz as on the chip. Lower it if this computer can't keep up with a heavy firmware (\"frames late\"); raise it if a firmware runs out of time. Changing it restarts the firmware");
                 // a menu in the clocks' order (the parameter's own order keeps v0.2.0's projects)
                 enum_menu(bar, setter, "clock", &params.clock, &Clock::ALL, 90.0, Clock::name);
+                bar.label("Audio").on_hover_text("The firmware's codec rate. Stock, Felucca, AudioBase, NineEighty and most community packages are 44.1 kHz; ORBIT-family 48 kHz builds need 48 kHz here, or pitch is flat by about 1.5 semitones");
+                enum_menu(bar, setter, "audio", &params.audio, &AudioRate::ALL, 80.0, AudioRate::name);
                 bar.label("Lead").on_hover_text("How far ahead of the host the firmware runs, beyond one host block: a note you play waits this long, plus the host's own buffers, before it sounds. 23 ms is room for any firmware; try less, and go back up if \"frames late\" appear in the status bar. An AU host learns the new latency when the plugin is loaded again");
                 enum_menu(bar, setter, "lead", &params.lead, &Lead::ALL, 70.0, Lead::name);
                 bar.separator();
@@ -135,12 +137,13 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                     ui.msg = said;
                     ui.msg_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
                 }
+                let rec_hz = params.audio.value().preset_hz() as u64;
                 let rec_label = match &file {
-                    Some((_, frames)) => format!("■ Stop  {}:{:02}", frames / 44_100 / 60, frames / 44_100 % 60),
+                    Some((_, frames)) => format!("■ Stop  {}:{:02}", frames / rec_hz / 60, frames / rec_hz % 60),
                     None => "● Record".into(),
                 };
                 if bar.add_enabled(booted, egui::Button::new(rec_label))
-                    .on_hover_text("Write the FM-1's output to a WAV (44.1 kHz, 16-bit) in your Music folder's fm1-emu").clicked() {
+                    .on_hover_text("Write the FM-1's output to a WAV (16-bit, at the Audio rate) in your Music folder's fm1-emu").clicked() {
                     let _ = link.cmds.send(Cmd::Record);
                 }
                 bar.separator();

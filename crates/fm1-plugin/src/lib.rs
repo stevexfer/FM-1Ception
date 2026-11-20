@@ -6,7 +6,8 @@
 //! with the host's project, and so is every flash sector the firmware writes (its patches), so a
 //! project reopens with the same firmware and sounds. The host's MIDI goes to the MIDI IN jack
 //! (channel messages optionally moved to one channel: M-VAVE's own firmware listens on 2), and
-//! the machine's 44.1 kHz output is resampled to the host's rate.
+//! the machine's codec-rate output (stock 44.1 kHz, or ORBIT-family 48,076.9 Hz) is resampled to the
+//! host's rate.
 
 use nih_plug::midi::MidiResult;
 use nih_plug::prelude::*;
@@ -71,10 +72,64 @@ pub struct Fm1Params {
     /// The emulated CPU's clock. Changing it reboots the firmware (its flash is kept).
     #[id = "clock"]
     pub clock: EnumParam<Clock>,
+    /// The codec's output rate: stock 44.1 kHz, or ORBIT-family 48,076.9 Hz. The host resamples from it.
+    #[id = "audio"]
+    pub audio: EnumParam<AudioRate>,
     /// How far ahead of the host the machine runs beyond one host block: the delay a played
     /// note hears. Changing it changes the latency the plugin reports.
     #[id = "lead"]
     pub lead: EnumParam<Lead>,
+}
+
+/// The firmware's I2S / codec rate. Stock, Felucca, AudioBase, NineEighty and most community
+/// packages are 44.1 kHz; ORBIT-family 48 kHz builds are [`AudioRate::Fs48`]. Playing those as
+/// 44.1 kHz leaves pitch flat by about 1.5 semitones.
+#[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioRate {
+    #[id = "44100"]
+    #[name = "44.1 kHz (stock)"]
+    Stock,
+    #[id = "48000"]
+    #[name = "48 kHz (ORBIT)"]
+    Fs48,
+}
+
+impl AudioRate {
+    pub fn frame_ns(self) -> Option<u64> {
+        match self {
+            AudioRate::Stock => None,
+            AudioRate::Fs48 => Some(engine::FRAME_NS_48),
+        }
+    }
+
+    pub fn sample_hz(self) -> f64 {
+        engine::sample_hz(self.frame_ns())
+    }
+
+    /// Preset / UI value: 44100 or 48000.
+    pub fn preset_hz(self) -> u32 {
+        match self {
+            AudioRate::Stock => 44_100,
+            AudioRate::Fs48 => 48_000,
+        }
+    }
+
+    pub fn from_preset_hz(hz: u32) -> Self {
+        if hz >= 47_000 {
+            AudioRate::Fs48
+        } else {
+            AudioRate::Stock
+        }
+    }
+
+    pub const ALL: [AudioRate; 2] = [AudioRate::Stock, AudioRate::Fs48];
+
+    pub fn name(self) -> String {
+        match self {
+            AudioRate::Stock => "44.1 kHz".into(),
+            AudioRate::Fs48 => "48 kHz".into(),
+        }
+    }
 }
 
 /// The emulated clock. The emulator runs one instruction a cycle at the chip's nominal 240 MHz,
@@ -171,6 +226,7 @@ impl Default for Fm1Params {
             channel: IntParam::new("MIDI channel", 0, IntRange::Linear { min: 0, max: 16 })
                 .with_value_to_string(Arc::new(|v| if v == 0 { "as sent".into() } else { v.to_string() })),
             clock: EnumParam::new("CPU clock", Clock::Mhz240).non_automatable(),
+            audio: EnumParam::new("Audio rate", AudioRate::Stock).non_automatable(),
             lead: EnumParam::new("Lead", Lead::Safe).non_automatable(),
         }
     }
@@ -206,10 +262,12 @@ pub struct Fm1 {
     audio: Option<rtrb::Consumer<[f32; 2]>>,
     /// machine frames per host sample
     ratio: f64,
+    host_hz: f64,
     /// how far ahead of the host the machine runs, in its frames: a host block and the lead chosen
     lead: usize,
     block: usize,
     lead_of: Lead,
+    audio_of: AudioRate,
     /// frames taken from the ring, and the resampler between the last two
     taken: u64,
     frac: f64,
@@ -226,7 +284,9 @@ impl Default for Fm1 {
             midi: None,
             audio: None,
             ratio: 1.0,
+            host_hz: RATE,
             lead: 2048,
+            audio_of: AudioRate::Stock,
             block: 1024,
             lead_of: Lead::Safe,
             taken: 0,
@@ -324,7 +384,9 @@ impl Plugin for Fm1 {
 
     fn initialize(&mut self, _layout: &AudioIOLayout, cfg: &BufferConfig, ctx: &mut impl InitContext<Self>) -> bool {
         let link = self.start();
-        self.ratio = RATE / cfg.sample_rate as f64;
+        self.host_hz = cfg.sample_rate as f64;
+        self.audio_of = self.params.audio.value();
+        self.ratio = self.audio_of.sample_hz() / self.host_hz.max(8_000.0);
         // a host block's frames, and the lead chosen: room for a DMA half and the emulation's unevenness
         self.block = (cfg.max_buffer_size as f64 * self.ratio).ceil() as usize;
         self.lead_of = self.params.lead.value();
@@ -338,13 +400,20 @@ impl Plugin for Fm1 {
     }
 
     fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, ctx: &mut impl ProcessContext<Self>) -> ProcessStatus {
-        // a new lead: the machine's thread reads the parameter itself; the host hears of the
-        // latency here (through nih-plug a restart request, which the AU wrapper does not act on:
-        // an AU host keeps the latency it was told until the plugin is loaded again)
+        // a new lead or codec rate: the machine's thread reads the parameters itself; the host
+        // hears of the latency here (through nih-plug a restart request, which the AU wrapper
+        // does not act on: an AU host keeps the latency it was told until the plugin is loaded again)
+        let audio = self.params.audio.value();
         let want = self.params.lead.value();
-        if want != self.lead_of {
+        if audio != self.audio_of || want != self.lead_of {
+            self.audio_of = audio;
+            self.ratio = audio.sample_hz() / self.host_hz.max(8_000.0);
+            self.block = (buffer.samples() as f64 * self.ratio).ceil().max(self.block as f64) as usize;
             self.lead_of = want;
             self.lead = self.block + want.frames();
+            if let Some(l) = &self.link {
+                let _ = l.cmds.send(Cmd::Block(self.block));
+            }
             ctx.set_latency_samples((self.lead as f64 / self.ratio).round() as u32);
         }
         let start = self.taken;

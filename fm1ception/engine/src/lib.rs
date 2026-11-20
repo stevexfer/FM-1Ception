@@ -81,6 +81,53 @@ impl ClockParam {
     }
 }
 
+/// The firmware's codec rate. Stock is 44.1 kHz; ORBIT-family 48 kHz builds use [`AudioRate::Fs48`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioRate {
+    Stock,
+    Fs48,
+}
+
+impl AudioRate {
+    pub fn frame_ns(self) -> Option<u64> {
+        match self {
+            AudioRate::Stock => None,
+            AudioRate::Fs48 => Some(engine::FRAME_NS_48),
+        }
+    }
+
+    pub fn sample_hz(self) -> f64 {
+        engine::sample_hz(self.frame_ns())
+    }
+
+    pub fn preset_hz(self) -> u32 {
+        match self {
+            AudioRate::Stock => 44_100,
+            AudioRate::Fs48 => 48_000,
+        }
+    }
+
+    pub fn from_preset_hz(hz: u32) -> Self {
+        if hz >= 47_000 {
+            AudioRate::Fs48
+        } else {
+            AudioRate::Stock
+        }
+    }
+}
+
+pub struct AudioParam(AtomicU32);
+
+impl AudioParam {
+    pub fn value(&self) -> AudioRate {
+        AudioRate::from_preset_hz(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, rate: AudioRate) {
+        self.0.store(rate.preset_hz(), Ordering::Relaxed);
+    }
+}
+
 /// Upstream's Lead parameter: frames the ring runs ahead beyond the host's block. FM-1Ception sends
 /// the whole lead as the block (`fm1e_set_lead`), so this is none.
 #[derive(Clone, Copy)]
@@ -114,6 +161,8 @@ pub struct Fm1Params {
     pub master: Level,
     /// The emulated clock. Changing it reboots the firmware, keeping its flash.
     pub clock: ClockParam,
+    /// The codec's output rate (stock 44.1 kHz or ORBIT-family 48,076.9 Hz). The host resamples from it.
+    pub audio: AudioParam,
     pub lead: LeadParam,
     pub rec: Mutex<RecView>,
 }
@@ -125,6 +174,7 @@ impl Default for Fm1Params {
             flash: Mutex::new(Vec::new()),
             master: Level(AtomicU32::new((900.0f32 / 1023.0).to_bits())),
             clock: ClockParam(AtomicU32::new(default_mhz(jit_available()))),
+            audio: AudioParam(AtomicU32::new(AudioRate::Stock.preset_hz())),
             lead: LeadParam(Lead(0)),
             rec: Mutex::new(RecView::default()),
         }
@@ -450,6 +500,31 @@ pub unsafe extern "C" fn fm1e_set_lead(e: *const Fm1e, frames: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn fm1e_set_clock(e: *const Fm1e, mhz: u32) {
     (&*e).params.clock.0.store(mhz.clamp(40, 800), Ordering::Relaxed);
+}
+
+/// The codec rate: `44100` (stock) or `48000` (ORBIT-family 48,076.9 Hz). Other values round to those.
+///
+/// # Safety
+/// `e` a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fm1e_set_audio_hz(e: *const Fm1e, hz: u32) {
+    (&*e).params.audio.set(AudioRate::from_preset_hz(hz));
+}
+
+/// # Safety
+/// `e` a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fm1e_audio_hz(e: *const Fm1e) -> u32 {
+    (&*e).params.audio.value().preset_hz()
+}
+
+/// Exact Hz of frames from `fm1e_pop`.
+///
+/// # Safety
+/// `e` a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fm1e_sample_rate(e: *const Fm1e) -> f64 {
+    (&*e).params.audio.value().sample_hz()
 }
 
 /// # Safety

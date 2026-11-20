@@ -8,11 +8,12 @@
 // FM-1Ception: up to eight emulated FM-1s, summed.
 //
 // Each engine is fm1-emu's machine on a thread of its own (engine/), so eight
-// engines run on eight cores. A thread keeps a ring of its 44.1 kHz frames a
-// fixed lead ahead of what this processor has taken; the host's MIDI is
-// stamped with the frame it belongs to, so notes keep their timing and the
-// lead is a constant reported as the plugin's latency. processBlock only moves
-// MIDI in and frames out, resampling each engine to the host's rate.
+// engines run on eight cores. A thread keeps a ring of its codec-rate frames a
+// fixed lead ahead of what this processor has taken (stock 44.1 kHz, or ORBIT-family
+// 48,076.9 Hz via setAudioHz); the host's MIDI is stamped with the frame it
+// belongs to, so notes keep their timing and the lead is a constant reported as
+// the plugin's latency. processBlock only moves MIDI in and frames out,
+// resampling each engine to the host's rate.
 //
 // Switching a slot off joins its thread but keeps the firmware, the flash it
 // wrote and the whole machine as it was, so switching it back on (or
@@ -28,6 +29,8 @@ public:
     static constexpr int kMaxEngines = 8;
     static constexpr float kDefaultMaster = 900.0f / 1023.0f;
     static inline const int kClocks[] { 120, 160, 240, 320, 400 };
+    /** Preset / menu values: stock 44.1 kHz, or ORBIT-family 48 kHz (exact rate 48076.9). */
+    static inline const int kAudioRates[] { 44100, 48000 };
 
     FM1CeptionProcessor();
     ~FM1CeptionProcessor() override;
@@ -107,6 +110,10 @@ public:
     int getClock (int slot) const { return slots[(size_t) slot].clockMhz.load(); }
     void setClock (int slot, int mhz);
 
+    /** Codec rate: 44100 (stock) or 48000 (ORBIT-family 48,076.9 Hz). Wrong rate leaves pitch off. */
+    int getAudioHz (int slot) const { return slots[(size_t) slot].audioHz.load(); }
+    void setAudioHz (int slot, int hz);
+
     /** 0: every channel; 1..16 only that one. */
     int getReceiveChannel (int slot) const { return slots[(size_t) slot].rxChannel.load(); }
     void setReceiveChannel (int slot, int ch) { slots[(size_t) slot].rxChannel = juce::jlimit (0, 16, ch); }
@@ -173,6 +180,8 @@ private:
         Fm1e* live = nullptr;
         juce::uint64 taken = 0;
         double frac = 0.0;
+        double ratio = (double) FM1E_RATE / 44100.0; // machine frames per host sample
+        int lead = 2048;                             // ring lead in this engine's frames
         float cur[2] {}, next[2] {};
         // what the firmware was last sent (after any channel move), to let go of it when the
         // routing changes: route -1 = hears nothing, else rx * 32 + tx
@@ -180,7 +189,7 @@ private:
         std::array<std::bitset<128>, 16> held {};
         std::array<bool, 16> sustain {};
 
-        std::atomic<int> clockMhz { 240 }, rxChannel { 0 }, txChannel { 0 };
+        std::atomic<int> clockMhz { 240 }, audioHz { FM1E_RATE }, rxChannel { 0 }, txChannel { 0 };
         std::atomic<bool> mute { false }, solo { false };
         std::atomic<float> peak[2] { 0.0f, 0.0f };
         juce::AudioParameterFloat* master = nullptr;
@@ -194,6 +203,7 @@ private:
     void stopEngine (Slot&);
     void runFileJob (int slot, const juce::File&, bool exporting);
     void setLeadFromBlockSize (double sampleRate);
+    void applySlotRatio (Slot&, double hostHz) const;
     static void sendMidi (Slot&, Fm1e*, juce::uint64 frame, juce::uint8 status, juce::uint8 d1, juce::uint8 d2, juce::uint8 len);
     static void releaseHeld (Slot&, Fm1e*, juce::uint64 frame);
 
@@ -207,7 +217,7 @@ private:
     std::atomic<int> midiMode { (int) MidiMode::selected }, selected { 0 }, viewLayout { (int) ViewLayout::tiled }, viewOptions { 0 };
     std::atomic<bool> multiOut { false };
 
-    double ratio = (double) FM1E_RATE / 44100.0;
+    double hostHz = 44100.0;
     int lead = 2048;
     int maxBlock = 512;
     float gainStep = 1.0f / 480.0f;

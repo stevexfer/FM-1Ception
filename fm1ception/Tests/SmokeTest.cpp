@@ -648,6 +648,7 @@ int main (int argc, char** argv)
         p.prepareToPlay (kSr, kBlock);
         p.setNumEngines (3);
         p.setClock (1, 160);
+        p.setAudioHz (1, 48000);
         p.setReceiveChannel (1, 3);
         p.setFirmwareChannel (2, 5);
         p.setMidiMode (FM1CeptionProcessor::MidiMode::multiChannel);
@@ -668,6 +669,7 @@ int main (int argc, char** argv)
         q.setStateInformation (state.getData(), (int) state.getSize());
         check (q.getNumEngines() == 3, "engine count");
         check (q.getClock (1) == 160 && q.getClock (0) == (int) fm1e_default_mhz(), "clocks");
+        check (q.getAudioHz (1) == 48000 && q.getAudioHz (0) == FM1E_RATE, "audio rates");
         check (q.getReceiveChannel (1) == 3 && q.getFirmwareChannel (2) == 5, "MIDI channels");
         check (std::abs (q.mainParam().convertFrom0to1 (q.mainParam().getValue()) - 0.5f) < 1.0e-4f, "main volume");
         check (q.getMidiMode() == FM1CeptionProcessor::MidiMode::multiChannel, "MIDI mode");

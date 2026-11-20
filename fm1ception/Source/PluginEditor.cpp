@@ -618,6 +618,37 @@ juce::PopupMenu FM1CeptionEditor::clockMenu (int slot)
     return m;
 }
 
+juce::String FM1CeptionEditor::audioRateText (int slot) const
+{
+    return proc.getAudioHz (slot) >= 47000 ? "48 kHz" : "44.1 kHz";
+}
+
+juce::PopupMenu FM1CeptionEditor::audioRateMenu (int slot)
+{
+    juce::PopupMenu m;
+    auto* p = &proc;
+    for (const int hz : FM1CeptionProcessor::kAudioRates)
+    {
+        bool ticked = true;
+        for (int i = 0; i < proc.getNumEngines(); ++i)
+            if (slot < 0 ? proc.getAudioHz (i) != hz : i == slot && proc.getAudioHz (i) != hz)
+                ticked = false;
+        const auto text = hz >= 47000
+                            ? juce::String ("48 kHz  (48k fw, e.g. ORBIT)")
+                            : juce::String ("44.1 kHz  (stock, Felucca, AudioBase, NineEighty, …)");
+        m.addItem (text, true, ticked, [p, slot, hz]
+        {
+            for (int i = 0; i < p->getNumEngines(); ++i)
+                if (slot < 0 || i == slot)
+                    p->setAudioHz (i, hz);
+        });
+    }
+    m.addSeparator();
+    m.addItem ("A 48 kHz firmware (e.g. ORBIT) played as 44.1 kHz is flat by about 1.5 semitones",
+               false, false, nullptr);
+    return m;
+}
+
 void FM1CeptionEditor::showMainMenu()
 {
     const int n = proc.getNumEngines();
@@ -675,6 +706,7 @@ void FM1CeptionEditor::showMainMenu()
     if (n == 1)
     {
         m.addSubMenu ("CPU Clock  (" + juce::String (proc.getClock (0)) + " MHz)", clockMenu (0));
+        m.addSubMenu ("Audio Rate  (" + audioRateText (0) + ")", audioRateMenu (0));
     }
     else
     {
@@ -684,6 +716,13 @@ void FM1CeptionEditor::showMainMenu()
         for (int i = 0; i < n; ++i)
             clock.addSubMenu (engineLabel (i) + "   " + juce::String (proc.getClock (i)) + " MHz", clockMenu (i));
         m.addSubMenu ("CPU Clock", clock);
+
+        juce::PopupMenu audio;
+        audio.addSubMenu ("All Engines", audioRateMenu (-1));
+        audio.addSeparator();
+        for (int i = 0; i < n; ++i)
+            audio.addSubMenu (engineLabel (i) + "   " + audioRateText (i), audioRateMenu (i));
+        m.addSubMenu ("Audio Rate", audio);
     }
 
     using Layout = FM1CeptionProcessor::ViewLayout;
@@ -764,6 +803,7 @@ void FM1CeptionEditor::showEngineMenu (int slot, int lcdRow)
     m.addSubMenu ("MIDI Channel  (" + routeText (slot) + ")", channelMenu (slot),
                   proc.getMidiMode() != FM1CeptionProcessor::MidiMode::multiChannel);
     m.addSubMenu ("CPU Clock  (" + juce::String (proc.getClock (slot)) + " MHz)", clockMenu (slot));
+    m.addSubMenu ("Audio Rate  (" + audioRateText (slot) + ")", audioRateMenu (slot));
     if (proc.isMultiOut())
         m.addItem (slot == 0 ? juce::String ("Output: Main")
                    : proc.isOutputEnabled (slot) ? "Output: Engine " + juce::String (slot + 1)

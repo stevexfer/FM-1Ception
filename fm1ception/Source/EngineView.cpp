@@ -614,6 +614,8 @@ void EngineView::refresh()
         else if (hasFirmware)
         {
             right << proc.getClock (index) << " MHz";
+            if (proc.getAudioHz (index) >= 47000)
+                right << "  48k";
             if (! status.jit)
                 right << "  INTERP";
             if (status.halted)

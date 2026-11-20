@@ -116,8 +116,11 @@ void FM1CeptionProcessor::startEngine (Slot& s)
         return;
 
     fm1e_set_clock (h->get(), (juce::uint32) s.clockMhz.load());
+    fm1e_set_audio_hz (h->get(), (juce::uint32) s.audioHz.load());
     fm1e_set_master (h->get(), s.master->get());
-    fm1e_set_lead (h->get(), (juce::uint32) lead);
+    applySlotRatio (s, hostHz);
+    s.lead = (int) std::ceil (maxBlock * s.ratio) + 1024;
+    fm1e_set_lead (h->get(), (juce::uint32) s.lead);
 
     if (! s.parkedPackage.isEmpty()
         && ! bootEngine (h->get(), s.parkedName, s.parkedPackage, s.parkedFlash, s.parkedMachine))
@@ -193,6 +196,25 @@ void FM1CeptionProcessor::setClock (int slot, int mhz)
         fm1e_set_clock (h->get(), (juce::uint32) mhz);
 }
 
+void FM1CeptionProcessor::setAudioHz (int slot, int hz)
+{
+    if (! juce::isPositiveAndBelow (slot, kMaxEngines))
+        return;
+    const int rate = hz >= 47000 ? 48000 : 44100;
+    auto& s = slots[(size_t) slot];
+    s.audioHz = rate;
+    if (auto h = engine (slot))
+        fm1e_set_audio_hz (h->get(), (juce::uint32) rate);
+    applySlotRatio (s, hostHz);
+    setLeadFromBlockSize (hostHz);
+}
+
+void FM1CeptionProcessor::applySlotRatio (Slot& s, double sampleRate) const
+{
+    const double src = s.audioHz.load() >= 47000 ? (1'000'000'000.0 / 20800.0) : (double) FM1E_RATE;
+    s.ratio = src / juce::jmax (8000.0, sampleRate);
+}
+
 //==============================================================================
 void FM1CeptionProcessor::runFileJob (int slot, const juce::File& file, bool exporting)
 {
@@ -265,6 +287,7 @@ juce::Result FM1CeptionProcessor::savePreset (int slot, const juce::File& file)
     preset.setProperty ("version", kPresetVersion, nullptr);
     preset.setProperty ("name", h->firmwareName(), nullptr);
     preset.setProperty ("clock", getClock (slot), nullptr);
+    preset.setProperty ("audioHz", getAudioHz (slot), nullptr);
     preset.setProperty ("package", h->package(), nullptr);
     preset.setProperty ("flash", h->flash(), nullptr);
     preset.setProperty ("machine", machine, nullptr);
@@ -318,8 +341,9 @@ juce::Result FM1CeptionProcessor::loadPreset (int slot, const juce::File& file)
     if (const auto* mb = preset.getProperty ("machine").getBinaryData())
         machine = *mb;
 
-    // (the machine runs at the clock it was saved at: the engine's has to be that one too)
+    // (the machine runs at the clock and codec rate it was saved at)
     setClock (slot, (int) preset.getProperty ("clock", (int) fm1e_default_mhz()));
+    setAudioHz (slot, (int) preset.getProperty ("audioHz", FM1E_RATE));
     if (! bootEngine (h->get(), preset.getProperty ("name").toString(), *pkg, flash, machine))
         return fail ("its flash was unreadable: booted the firmware without it");
     h->post ("Loaded preset " + file.getFileNameWithoutExtension());
@@ -357,6 +381,7 @@ void FM1CeptionProcessor::duplicateToAll (int slot)
     }
 
     const int mhz = getClock (slot);
+    const int audioHz = getAudioHz (slot);
     const float master = slots[(size_t) slot].master->get();
     std::vector<std::shared_ptr<fm1c::EngineHandle>> targets;
     for (int i = 0; i < numEngines.load(); ++i)
@@ -367,6 +392,7 @@ void FM1CeptionProcessor::duplicateToAll (int slot)
         targets.push_back (h);
         // (the engine's own clock follows at its boot, so it does not restart its old firmware first)
         slots[(size_t) i].clockMhz = mhz;
+        setAudioHz (i, audioHz);
         auto& p = *slots[(size_t) i].master;
         p.beginChangeGesture();
         p.setValueNotifyingHost (p.convertTo0to1 (master));
@@ -379,7 +405,7 @@ void FM1CeptionProcessor::duplicateToAll (int slot)
     }
 
     src->post ("Duplicating to " + juce::String ((int) targets.size()) + " engines...", 60000);
-    juce::Thread::launch ([src, targets, mhz, from = slot + 1]
+    juce::Thread::launch ([src, targets, mhz, audioHz, from = slot + 1]
     {
         // the whole machine, so the copies are where it is: the preset as edited, the same screen
         const auto machine = src->saveState();
@@ -395,6 +421,7 @@ void FM1CeptionProcessor::duplicateToAll (int slot)
         for (const auto& h : targets)
         {
             fm1e_set_clock (h->get(), (juce::uint32) mhz);
+            fm1e_set_audio_hz (h->get(), (juce::uint32) audioHz);
             const bool ok = bootEngine (h->get(), name, pkg, flash, machine);
             h->post (ok ? "Duplicated from engine " + juce::String (from) : juce::String ("Not duplicated"), 8000);
         }
@@ -406,23 +433,30 @@ void FM1CeptionProcessor::duplicateToAll (int slot)
 //==============================================================================
 void FM1CeptionProcessor::setLeadFromBlockSize (double sampleRate)
 {
-    ratio = (double) FM1E_RATE / juce::jmax (8000.0, sampleRate);
-    // a host block's frames, and room for a DMA half and the emulation's unevenness
-    lead = (int) std::ceil (maxBlock * ratio) + 1024;
-    setLatencySamples (juce::roundToInt (lead / ratio));
+    hostHz = sampleRate;
+    double maxRatio = (double) FM1E_RATE / juce::jmax (8000.0, sampleRate);
+    for (int i = 0; i < kMaxEngines; ++i)
+    {
+        applySlotRatio (slots[(size_t) i], sampleRate);
+        maxRatio = juce::jmax (maxRatio, slots[(size_t) i].ratio);
+    }
+    // reported latency: a host block at the fastest codec rate, plus room for a DMA half
+    lead = (int) std::ceil (maxBlock * maxRatio) + 1024;
+    setLatencySamples (juce::roundToInt (lead / maxRatio));
+
+    const juce::ScopedLock sl (slotsLock);
+    for (auto& s : slots)
+    {
+        s.lead = (int) std::ceil (maxBlock * s.ratio) + 1024;
+        if (s.handle != nullptr)
+            fm1e_set_lead (s.handle->get(), (juce::uint32) s.lead);
+    }
 }
 
 void FM1CeptionProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     maxBlock = juce::jmax (1, samplesPerBlock);
     setLeadFromBlockSize (sampleRate);
-
-    {
-        const juce::ScopedLock sl (slotsLock);
-        for (auto& s : slots)
-            if (s.handle != nullptr)
-                fm1e_set_lead (s.handle->get(), (juce::uint32) lead);
-    }
 
     mainGain.reset (sampleRate, 0.02);
     const float v = mainVolume->get();
@@ -537,7 +571,7 @@ void FM1CeptionProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                 const int route = hears ? rx * 32 + tx : -1;
                 if (route != s.route)
                 {
-                    releaseHeld (s, e, start + (juce::uint64) lead);
+                    releaseHeld (s, e, start + (juce::uint64) s.lead);
                     s.route = route;
                 }
 
@@ -552,7 +586,7 @@ void FM1CeptionProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                     if (rx != 0 && (d[0] & 0x0f) != rx - 1)
                         continue;
                     const auto status = (juce::uint8) (tx != 0 ? ((d[0] & 0xf0) | (tx - 1)) : d[0]);
-                    const auto frame = start + (juce::uint64) (meta.samplePosition * ratio) + (juce::uint64) lead;
+                    const auto frame = start + (juce::uint64) (meta.samplePosition * s.ratio) + (juce::uint64) s.lead;
                     sendMidi (s, e, frame, status, len > 1 ? d[1] : 0, len > 2 ? d[2] : 0, (juce::uint8) len);
                 }
 
@@ -566,7 +600,7 @@ void FM1CeptionProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                 juce::uint64 starved = 0;
                 for (int i = 0; i < n; ++i)
                 {
-                    s.frac += ratio;
+                    s.frac += s.ratio;
                     while (s.frac >= 1.0)
                     {
                         float f[2];
@@ -700,6 +734,7 @@ void FM1CeptionProcessor::getStateInformation (juce::MemoryBlock& destData)
             juce::ValueTree slot (kSlotType);
             slot.setProperty ("index", i, nullptr);
             slot.setProperty ("clock", s.clockMhz.load(), nullptr);
+            slot.setProperty ("audioHz", s.audioHz.load(), nullptr);
             slot.setProperty ("rx", s.rxChannel.load(), nullptr);
             slot.setProperty ("tx", s.txChannel.load(), nullptr);
             slot.setProperty ("mute", s.mute.load(), nullptr);
@@ -757,10 +792,12 @@ void FM1CeptionProcessor::setStateInformation (const void* data, int sizeInBytes
                     slot = c;
 
             s.clockMhz = (int) slot.getProperty ("clock", (int) fm1e_default_mhz());
+            s.audioHz = (int) slot.getProperty ("audioHz", FM1E_RATE) >= 47000 ? 48000 : FM1E_RATE;
             s.rxChannel = juce::jlimit (0, 16, (int) slot.getProperty ("rx", 0));
             s.txChannel = juce::jlimit (0, 16, (int) slot.getProperty ("tx", 0));
             s.mute = (bool) slot.getProperty ("mute", false);
             s.solo = (bool) slot.getProperty ("solo", false);
+            applySlotRatio (s, hostHz);
 
             juce::String name;
             juce::MemoryBlock pkg, flash, machine;
@@ -776,6 +813,7 @@ void FM1CeptionProcessor::setStateInformation (const void* data, int sizeInBytes
             {
                 auto* e = s.handle->get();
                 fm1e_set_clock (e, (juce::uint32) s.clockMhz.load());
+                fm1e_set_audio_hz (e, (juce::uint32) s.audioHz.load());
                 if (pkg.isEmpty())
                     fm1e_unload (e);
                 else

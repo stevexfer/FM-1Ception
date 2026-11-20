@@ -649,7 +649,7 @@ struct AudioRing {
     dead: AtomicBool,
 }
 
-fn start_audio(ring: Arc<AudioRing>, buffer: Option<u32>) -> Result<cpal::Stream, String> {
+fn start_audio(ring: Arc<AudioRing>, buffer: Option<u32>, source_hz: f64) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
@@ -668,24 +668,31 @@ fn start_audio(ring: Arc<AudioRing>, buffer: Option<u32>) -> Result<cpal::Stream
             eprintln!("audio: the device does not take a {n}-frame buffer ({:?}); its own it is", cfg.buffer_size());
         }
     }
-    let stream = match output_stream(&dev, &config, ring.clone()) {
+    let stream = match output_stream(&dev, &config, ring.clone(), source_hz) {
         Ok(s) => s,
         Err(e) if config.buffer_size != cpal::BufferSize::Default => {
             eprintln!("audio: a {:?} buffer: {e}; the device's own it is", config.buffer_size);
             config.buffer_size = cpal::BufferSize::Default;
-            output_stream(&dev, &config, ring)?
+            output_stream(&dev, &config, ring, source_hz)?
         }
         Err(e) => return Err(e),
     };
-    eprintln!("audio: {} at {} Hz, {} channels, buffer {:?}", dev.name().unwrap_or_default(), config.sample_rate.0, config.channels, config.buffer_size);
+    eprintln!(
+        "audio: {} at {} Hz (firmware {:.1} Hz), {} channels, buffer {:?}",
+        dev.name().unwrap_or_default(),
+        config.sample_rate.0,
+        source_hz,
+        config.channels,
+        config.buffer_size
+    );
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
-/// The output stream: the ring's 44.1 kHz frames, resampled to the device's rate.
-fn output_stream(dev: &cpal::Device, config: &cpal::StreamConfig, ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+/// The output stream: the ring's codec-rate frames, resampled to the device's rate.
+fn output_stream(dev: &cpal::Device, config: &cpal::StreamConfig, ring: Arc<AudioRing>, source_hz: f64) -> Result<cpal::Stream, String> {
     let channels = config.channels as usize;
-    let step = 44_100.0 / config.sample_rate.0 as f64; // source frames per output frame
+    let step = source_hz / config.sample_rate.0 as f64; // source frames per output frame
     let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
     dev.build_output_stream(
         config,
@@ -1395,7 +1402,7 @@ env: FM1_BENCH_KEYS='T:PLAY,T:PLAY^,T:C4@100,T:e0:+3,T:pot:512,T:mHEX'  scripted
      FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)
      FM1_USB_SEND='MS:HEX;…'  --shot --usb: MIDI messages over USB at those times (@PATH: from a file); FM1_USB_TRACE: the bus
      FM1_USB_SIE_NS=N      --usb: each SIE register access takes N ns (default 1000)
-     FM1_AUDIO_FRAME_NS=N  an I2S frame takes N ns (default: the stock 44.1 kHz; 20800 for a firmware at 160 MHz / 13 / 256)
+     FM1_AUDIO_FRAME_NS=N  an I2S frame takes N ns (default: the stock 44.1 kHz; 20800 for a firmware at 160 MHz / 13 / 256). Also sets the speaker and WAV rate, so a 48 kHz firmware is not flat by ~1.5 semitones
      FM1_USB_PLAY=FILE     --usb, --bench / --shot: play FILE (s16le stereo, no header) to the device's USB audio
                            output as a computer would, from FM1_USB_PLAY_AT ms on (default 0)
      FM1_USB_WAV=FILE      --usb, --bench / --shot: record the USB audio as a computer would (s16le, no header);
@@ -1589,10 +1596,15 @@ fn main() {
         }
         false
     };
+    // the codec rate for the speaker and for F3's WAV (fixed for the run: FM1_AUDIO_FRAME_NS)
+    let codec_hz = match m.soc.periph.frame_ns {
+        Some(ns) if ns > 0 => 1_000_000_000.0 / ns as f64,
+        _ => 44_100.0,
+    };
     let _stream = if exclusive_on {
         None
     } else {
-        match start_audio(ring.clone(), o.buffer) {
+        match start_audio(ring.clone(), o.buffer, codec_hz) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("audio off: {e}");
@@ -1886,7 +1898,7 @@ fn main() {
             }
         }
         if win.is_key_pressed(Key::F3, KeyRepeat::No) {
-            toggle_record(&recorder, &o.name);
+            toggle_record(&recorder, &o.name, codec_hz.round() as u32);
         }
         for t in turning.iter_mut() {
             *t = t.saturating_sub(1);
@@ -1942,16 +1954,16 @@ fn main() {
 /// F3: start a WAV of the output (in the Music folder's fm1-emu), or finish the one being written.
 /// (The file is finished or created outside the lock, which the emulation thread takes for every
 /// block: a slow disk must not hold up the audio.)
-fn toggle_record(rec: &Mutex<Option<wav::Wav>>, name: &str) {
+fn toggle_record(rec: &Mutex<Option<wav::Wav>>, name: &str, rate: u32) {
     let taken = rec.lock().unwrap().take();
     match taken {
         Some(w) => match w.finish() {
             Ok(p) => eprintln!("recorded {}", p.display()),
             Err(e) => eprintln!("recording: {e}"),
         },
-        None => match wav::Wav::create(name) {
+        None => match wav::Wav::create_at(name, rate) {
             Ok(w) => {
-                eprintln!("recording to {} (F3 stops)", w.path.display());
+                eprintln!("recording to {} at {rate} Hz (F3 stops)", w.path.display());
                 *rec.lock().unwrap() = Some(w);
             }
             Err(e) => eprintln!("recording: {e}"),

@@ -1,7 +1,9 @@
 /*
     One emulated FM-1 per handle (engine/src/lib.rs), each on a thread of its own that runs a
-    little ahead of the host: it keeps a ring of 44.1 kHz stereo frames `lead` frames ahead of
+    little ahead of the host: it keeps a ring of codec-rate stereo frames `lead` frames ahead of
     what has been popped, and takes each MIDI message when it reaches the frame it is stamped with.
+    The ring is stock 44.1 kHz by default (`FM1E_RATE`); ORBIT-family 48 kHz firmwares need
+    `fm1e_set_audio_hz(..., 48000)` so pitch is not flat by ~1.5 semitones.
 
     Threads:
       - fm1e_push_midi and fm1e_pop belong to the audio thread: one thread at a time per handle.
@@ -44,6 +46,12 @@ uint32_t fm1e_default_mhz (void);
 void fm1e_set_lead (const Fm1e*, uint32_t frames);
 /* the emulated CPU clock; a change reboots the firmware, keeping its flash */
 void fm1e_set_clock (const Fm1e*, uint32_t mhz);
+/* the codec rate the ring is at: 44100 (stock, default) or 48000 (ORBIT-family 48,076.9 Hz).
+   The host must resample from fm1e_sample_rate(). */
+void fm1e_set_audio_hz (const Fm1e*, uint32_t hz);
+uint32_t fm1e_audio_hz (const Fm1e*);
+/* exact Hz of frames from fm1e_pop (44100.0 or 1000000000/20800) */
+double fm1e_sample_rate (const Fm1e*);
 /* the MASTER pot, 0..1 */
 void fm1e_set_master (const Fm1e*, float value);
 

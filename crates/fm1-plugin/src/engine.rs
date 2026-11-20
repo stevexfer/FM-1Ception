@@ -1,11 +1,15 @@
 //! The emulated FM-1 on a thread of its own, running a little ahead of the host.
 //!
 //! The firmware makes its audio in DMA halves, and how long a half takes to emulate varies, so the
-//! machine does not run inside the host's audio callback: this thread keeps a ring of its 44.1 kHz
+//! machine does not run inside the host's audio callback: this thread keeps a ring of its codec-rate
 //! frames `lead` frames ahead of what the host has taken, and the host's MIDI reaches it stamped
 //! with the frame it belongs to (`lead` frames after the frame the host was playing). The machine
 //! takes each event once it has made that many frames, so notes keep their spacing and the delay
 //! is a constant the plugin reports to the host as its latency.
+//!
+//! The ring's rate is the codec's: stock 44.1 kHz by default, or ORBIT-family 48,076.9 Hz
+//! (`FRAME_NS_48`, 160 MHz / 13 / 256) when the host selects a 48 kHz firmware. Playing a 48 kHz
+//! firmware's samples as 44.1 kHz leaves pitch flat by about 1.5 semitones.
 
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Board, Soc};
@@ -16,8 +20,21 @@ use std::time::{Duration, Instant};
 
 const RAM_BASE: u32 = 0x01c0_0000;
 const RAM_SIZE: usize = 1 << 20;
-/// The firmware's output rate.
+/// Stock firmware output rate (and the ring's default).
 pub const RATE: f64 = 44_100.0;
+/// One I2S frame at the ORBIT-family 48 kHz clock (160 MHz / 13 / 256), nanoseconds: `fm1-live`'s
+/// `FM1_AUDIO_FRAME_NS=20800`.
+pub const FRAME_NS_48: u64 = 20_800;
+/// Exact ORBIT-family 48 kHz rate: 1e9 / [`FRAME_NS_48`].
+pub const RATE_48: f64 = 1_000_000_000.0 / FRAME_NS_48 as f64;
+
+/// Playback rate of the machine's audio ring for a given I2S frame time.
+pub fn sample_hz(frame_ns: Option<u64>) -> f64 {
+    match frame_ns {
+        Some(ns) if ns > 0 => 1_000_000_000.0 / ns as f64,
+        _ => RATE,
+    }
+}
 /// Flash sectors, for saving what the firmware wrote (its patches) with the host's project.
 const SECTOR: usize = 4096;
 /// The host's MIDI reaches the jack's UART 16 times as fast as the jack's 31250 baud: a chord
@@ -26,7 +43,7 @@ const SECTOR: usize = 4096;
 /// 256-byte receive ring between the blocks it reads it in.
 const MIDI_SPEED: u64 = 16;
 
-/// A MIDI message for the machine, with the frame (of its 44.1 kHz output) it is due at.
+/// A MIDI message for the machine, with the frame (of its codec-rate output) it is due at.
 #[derive(Clone, Copy, Default)]
 pub struct Midi {
     pub frame: u64,
@@ -94,8 +111,9 @@ struct Machine {
 }
 
 impl Machine {
-    /// `lcd_timed`: the LCD's transfers take their time, as on an FM-1 (fm1_soc's `Soc::lcd_timed`)
-    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64, lcd_timed: bool) -> Result<Self, String> {
+    /// `lcd_timed`: the LCD's transfers take their time, as on an FM-1 (fm1_soc's `Soc::lcd_timed`).
+    /// `frame_ns`: `Some(FRAME_NS_48)` for an ORBIT-family 48 kHz firmware; `None` for stock 44.1 kHz.
+    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64, lcd_timed: bool, frame_ns: Option<u64>) -> Result<Self, String> {
         crate::savefile::validate_sectors(&sectors.iter().map(|(at, data)| crate::Sector {
             at: *at, data: Arc::new(data.clone()),
         }).collect::<Vec<_>>())?;
@@ -105,6 +123,7 @@ impl Machine {
         soc.periph.hz = mhz * 1_000_000;
         soc.periph.skip_idle = true;
         soc.periph.midi_speed = MIDI_SPEED;
+        soc.periph.frame_ns = frame_ns;
         soc.lcd_timed = lcd_timed;
         let mut cpu = Cpu::new(st.entry);
         cpu.jit_on = true;
@@ -133,17 +152,18 @@ impl Machine {
             return Err("the firmware has stopped".into());
         }
         let sectors = self.changed_sectors();
-        let fresh = Machine::boot(pkg, &sectors, self.soc.periph.hz / 1_000_000, self.soc.lcd_timed)?;
+        let fresh = Machine::boot(pkg, &sectors, self.soc.periph.hz / 1_000_000, self.soc.lcd_timed, self.soc.periph.frame_ns)?;
         let state = fm1_soc::state::save(&self.cpu, self.cpu1.as_ref(), &self.soc, self.pending_tick, &fresh.soc)?;
         Ok((sectors, state))
     }
 
     /// The machine a save-state was taken of, from the package and flash it was saved with.
-    fn restore(pkg: &[u8], sectors: &[(u32, Vec<u8>)], state: &[u8]) -> Result<Self, String> {
+    fn restore(pkg: &[u8], sectors: &[(u32, Vec<u8>)], state: &[u8], frame_ns: Option<u64>) -> Result<Self, String> {
         let hz = fm1_soc::state::clock_hz(state).ok_or("not a machine state")?;
-        let fresh = Machine::boot(pkg, sectors, hz / 1_000_000, fm1_soc::lcd_timed_from_env())?;
+        let fresh = Machine::boot(pkg, sectors, hz / 1_000_000, fm1_soc::lcd_timed_from_env(), frame_ns)?;
         let mut m = fm1_soc::state::restore(state, fresh.soc)?;
         m.soc.periph.midi_speed = MIDI_SPEED;
+        m.soc.periph.frame_ns = frame_ns; // (a save-state does not carry the codec rate)
         Ok(Machine { cpu: m.cpu, cpu1: m.cpu1, soc: m.soc, pending_tick: m.pending_tick, halted: false, flash0: fresh.flash0 })
     }
 
@@ -245,13 +265,13 @@ pub fn run(
             let (c, prepared, loaded) = match c {
                 Cmd::Load { firmware, sectors, reply } => {
                     let sectors: Sectors = sectors.iter().map(|s| (s.at, s.data.to_vec())).collect();
-                    match Machine::boot(&firmware.pkg, &sectors, params.clock.value().mhz(), lcd_timed) {
+                    match Machine::boot(&firmware.pkg, &sectors, params.clock.value().mhz(), lcd_timed, params.audio.value().frame_ns()) {
                         Ok(next) => (Cmd::Boot { pkg: firmware.pkg.clone(), sectors }, Some(next), Some((firmware, reply))),
                         Err(error) => { let _ = reply.send(Err(error)); continue; }
                     }
                 }
                 Cmd::Restore { pkg, sectors, state, reply } => {
-                    let restored = Machine::restore(&pkg, &sectors, &state);
+                    let restored = Machine::restore(&pkg, &sectors, &state, params.audio.value().frame_ns());
                     let _ = reply.send(restored.as_ref().map(|_| ()).map_err(Clone::clone));
                     (Cmd::Boot { pkg, sectors }, restored.ok(), None)
                 }
@@ -260,7 +280,7 @@ pub fn run(
             match c {
                 Cmd::Boot { pkg, sectors } => {
                     cancel_snapshots(&mut pending);
-                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz(), lcd_timed).ok());
+                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz(), lcd_timed, params.audio.value().frame_ns()).ok());
                     active_pkg = m.as_ref().map(|_| pkg);
                     pot = u16::MAX;
                     let mut v = shared.view.lock().unwrap();
@@ -318,13 +338,15 @@ pub fn run(
         }
         // the ring's lead: the host's block and the Lead parameter, as the window sets it
         let lead = block + params.lead.value().frames();
+        let frame_ns = params.audio.value().frame_ns();
         // a new clock: the machine's timers count its cycles, so boot it again on the new one,
-        // with what the firmware wrote to its flash
+        // with what the firmware wrote to its flash. A new codec rate only moves frame_ns: the
+        // samples stay the same kind of frames, and the host's resample ratio follows.
         let mhz = params.clock.value().mhz();
         if let (Some(mm), Some(pkg)) = (m.as_ref(), active_pkg.as_ref()) {
             if mm.soc.periph.hz != mhz * 1_000_000 && pending.is_empty() {
                 let sectors = mm.changed_sectors();
-                if let Ok(next) = Machine::boot(pkg, &sectors, mhz, lcd_timed) {
+                if let Ok(next) = Machine::boot(pkg, &sectors, mhz, lcd_timed, frame_ns) {
                     m = Some(next);
                     pot = u16::MAX;
                     due.clear();
@@ -333,6 +355,11 @@ pub fn run(
                     starved0 = v.starved;
                     (speed_t, speed_ms, busy) = (Instant::now(), 0, Duration::ZERO);
                 }
+            }
+        }
+        if let Some(mm) = m.as_mut() {
+            if mm.soc.periph.frame_ns != frame_ns {
+                mm.soc.periph.frame_ns = frame_ns;
             }
         }
         snapshots(&mut pending, m.as_ref(), &params, Instant::now());
@@ -451,7 +478,8 @@ fn record(rec: &mut Option<crate::wav::Wav>, params: &crate::Fm1Params) {
         },
         None => {
             let name = params.firmware.lock().unwrap().name.clone();
-            match crate::wav::Wav::create(if name.is_empty() { "fm1" } else { &name }) {
+            let rate = params.audio.value().sample_hz().round() as u32;
+            match crate::wav::Wav::create_at(if name.is_empty() { "fm1" } else { &name }, rate) {
                 Ok(w) => {
                     let m = format!("Recording to {}", w.path.display());
                     *rec = Some(w);
@@ -480,6 +508,16 @@ fn rtrb_fill(p: &rtrb::Producer<[f32; 2]>) -> usize {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+
+    #[test]
+    fn felucca_48k_is_about_one_and_a_half_semitones_above_stock() {
+        // Playing 48,076.9 Hz samples as 44.1 kHz leaves pitch flat by this many semitones.
+        let cents = 1200.0 * (RATE_48 / RATE).log2();
+        assert!((cents - 149.4).abs() < 0.2, "got {cents} cents");
+        assert_eq!(sample_hz(Some(FRAME_NS_48)), RATE_48);
+        assert_eq!(sample_hz(None), RATE);
+    }
+
     fn machine() -> Machine {
         let soc = Soc::new(RAM_SIZE, vec![0x55; 0x80000]);
         let flash0 = soc.flash.mem.clone();
@@ -540,7 +578,7 @@ mod portable_tests {
         let midi = |m: &mut Machine, bytes: &[u8]| bytes.iter().for_each(|&b| m.soc.periph.apply(&Action::Midi { b }));
 
         // a session: another preset, knobs turned, a chord still sounding when it is saved
-        let (mut a, mut heard) = (Machine::boot(&pkg, &[], 240, fm1_soc::lcd_timed_from_env()).unwrap(), Vec::new());
+        let (mut a, mut heard) = (Machine::boot(&pkg, &[], 240, fm1_soc::lcd_timed_from_env(), None).unwrap(), Vec::new());
         play(&mut a, 3000, &mut heard);
         a.soc.periph.apply(&Action::Enc { enc: 6, clicks: 2 });
         a.soc.periph.apply(&Action::Enc { enc: 2, clicks: -9 });
@@ -551,7 +589,7 @@ mod portable_tests {
         let (sectors, state) = a.save_state(&pkg).unwrap();
         let saved_in = t.elapsed();
         let t = std::time::Instant::now();
-        let mut b = Machine::restore(&pkg, &sectors, &state).unwrap();
+        let mut b = Machine::restore(&pkg, &sectors, &state, None).unwrap();
         eprintln!("state {} bytes, saved in {saved_in:?}, restored in {:?}", state.len(), t.elapsed());
         assert_eq!(b.save_state(&pkg).unwrap().1, state, "it saves as the same state again");
 
@@ -566,7 +604,7 @@ mod portable_tests {
         assert!(ha == hb, "the same audio ({} samples, first difference at {:?})", ha.len(),
                 ha.iter().zip(&hb).position(|(x, y)| x != y));
         assert!(a.save_state(&pkg).unwrap().1 == b.save_state(&pkg).unwrap().1, "the same machine");
-        assert!(Machine::restore(&pkg, &[(0xff000, vec![0; 4096])], &state).is_err(), "not against other flash");
+        assert!(Machine::restore(&pkg, &[(0xff000, vec![0; 4096])], &state, None).is_err(), "not against other flash");
     }
 
     #[test]

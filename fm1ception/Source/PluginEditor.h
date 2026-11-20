@@ -104,6 +104,8 @@ private:
     juce::String routeText (int slot) const;
     juce::PopupMenu channelMenu (int slot);
     juce::PopupMenu clockMenu (int slot);
+    juce::PopupMenu audioRateMenu (int slot);
+    juce::String audioRateText (int slot) const;
     juce::String engineLabel (int slot) const;
     void chooseFile (int slot, bool exporting);
     /** Loads it into the engine, counting a firmware's launch (FirmwareLibrary::noteLaunch). */

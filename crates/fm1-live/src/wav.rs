@@ -1,20 +1,19 @@
-//! A 44.1 kHz 16-bit stereo WAV recorder (fm1-live's F3, the plugin's Record).
+//! A 16-bit stereo WAV recorder (fm1-live's F3, the plugin's Record). Rate defaults to 44.1 kHz;
+//! ORBIT-family 48 kHz sessions pass the codec rate so the file plays at the right pitch.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// The most frames a WAV holds: its sizes are 32-bit (about 6.7 hours at 44.1 kHz).
 const MAX_FRAMES: u64 = (u32::MAX as u64 - 36) / 4;
-/// How often the header's lengths are brought up to date while recording (2 s of audio), so a
-/// crash or a killed host leaves a file that plays up to there.
-const PATCH_FRAMES: u64 = 2 * 44_100;
 
-/// A 44.1 kHz 16-bit stereo WAV being written.
+/// A 16-bit stereo WAV being written at `rate` Hz.
 pub struct Wav {
     file: std::io::BufWriter<std::fs::File>,
     pub path: PathBuf,
     pub frames: u64,
     patched: u64,
+    rate: u32,
     /// Why the recording stopped taking samples (a failed write, the size limit); `finish` reports it.
     pub error: Option<String>,
 }
@@ -22,6 +21,11 @@ pub struct Wav {
 impl Wav {
     /// A new file in the user's Music folder (fm1-emu/), else the temporary folder's fm1-emu/.
     pub fn create(name: &str) -> std::io::Result<Wav> {
+        Self::create_at(name, 44_100)
+    }
+
+    /// As [`Self::create`], at the firmware's codec rate.
+    pub fn create_at(name: &str, rate: u32) -> std::io::Result<Wav> {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(|h| PathBuf::from(h).join("Music").join("fm1-emu"));
         let dir = home
@@ -31,11 +35,16 @@ impl Wav {
             .ok_or_else(|| std::io::Error::other("no folder to record into (Music/fm1-emu, nor the temporary folder)"))?;
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        Self::create_in(&dir, &format!("fm1-{}-{secs}", clean.trim_matches('-')))
+        Self::create_in_at(&dir, &format!("fm1-{}-{secs}", clean.trim_matches('-')), rate)
     }
 
     /// A new file `<stem>.wav` in `dir`, or `<stem>-2.wav`, `-3`, ... : never one that exists.
     pub fn create_in(dir: &Path, stem: &str) -> std::io::Result<Wav> {
+        Self::create_in_at(dir, stem, 44_100)
+    }
+
+    /// As [`Self::create_in`], at `rate` Hz.
+    pub fn create_in_at(dir: &Path, stem: &str, rate: u32) -> std::io::Result<Wav> {
         let mut n = 1;
         let (path, file) = loop {
             let path = dir.join(if n == 1 { format!("{stem}.wav") } else { format!("{stem}-{n}.wav") });
@@ -46,8 +55,9 @@ impl Wav {
             }
         };
         let mut file = std::io::BufWriter::new(file);
-        file.write_all(&header(0))?;
-        Ok(Wav { file, path, frames: 0, patched: 0, error: None })
+        let rate = rate.max(8_000);
+        file.write_all(&header(0, rate))?;
+        Ok(Wav { file, path, frames: 0, patched: 0, rate, error: None })
     }
 
     /// Interleaved stereo samples. After a failed write or at the size limit it takes no more and
@@ -69,7 +79,7 @@ impl Wav {
         self.frames += s.len() as u64 / 2;
         if self.frames >= MAX_FRAMES {
             self.error = Some("stopped at the 4 GB a WAV can hold".into());
-        } else if self.frames - self.patched >= PATCH_FRAMES {
+        } else if self.frames - self.patched >= 2 * self.rate as u64 {
             if let Err(e) = self.patch() {
                 self.error = Some(format!("writing stopped: {e}"));
             }
@@ -79,7 +89,7 @@ impl Wav {
     /// The header's lengths to what has been written, and back to the end.
     fn patch(&mut self) -> std::io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header((self.frames * 4) as u32))?;
+        self.file.write_all(&header((self.frames * 4) as u32, self.rate))?;
         self.file.seek(SeekFrom::End(0))?;
         self.patched = self.frames;
         Ok(())
@@ -97,9 +107,9 @@ impl Wav {
     }
 }
 
-fn header(data: u32) -> [u8; 44] {
+fn header(data: u32, rate: u32) -> [u8; 44] {
     let mut h = [0u8; 44];
-    let (rate, ch, bits) = (44_100u32, 2u16, 16u16);
+    let (ch, bits) = (2u16, 16u16);
     h[0..4].copy_from_slice(b"RIFF");
     h[4..8].copy_from_slice(&(36 + data).to_le_bytes());
     h[8..16].copy_from_slice(b"WAVEfmt ");
@@ -148,15 +158,16 @@ mod tests {
     fn the_header_follows_the_recording_while_it_runs() {
         let d = dir("patch");
         let mut w = Wav::create_in(&d, "t").unwrap();
+        let patch = 2 * w.rate as u64; // how often the header is patched (2 s)
         let block = vec![0i16; 2 * 1000];
-        for _ in 0..(PATCH_FRAMES / 1000 + 1) {
+        for _ in 0..(patch / 1000 + 1) {
             w.write(&block);
         }
         // not finished (as after a crash): the header already counts the first 2 s
         let len = data_len(&w.path);
-        assert!(len as u64 >= PATCH_FRAMES * 4 && len as u64 <= w.frames * 4, "{len}");
+        assert!(len as u64 >= patch * 4 && len as u64 <= w.frames * 4, "{len}");
         let p = w.finish().unwrap();
-        assert_eq!(data_len(&p) as u64, (PATCH_FRAMES / 1000 + 1) * 1000 * 4);
+        assert_eq!(data_len(&p) as u64, (patch / 1000 + 1) * 1000 * 4);
         let _ = std::fs::remove_dir_all(&d);
     }
 
