@@ -173,6 +173,11 @@ which takes half the time, add `-DCMAKE_OSX_ARCHITECTURES=arm64`. The plugins ar
 by the build: they are in `build/FM1Ception_artefacts/Release/` (AU, VST3, Standalone). On Linux,
 copy `FM-1Ception.vst3` into `~/.vst3/` for your hosts to find it.
 
+On Windows, the **Standalone** build includes JUCE's ASIO driver type (the Steinberg headers
+shipped with JUCE), so **Options → Audio settings** can use ASIO as well as WASAPI. The VST3
+relies on the host for I/O (Reaper, Ableton, etc. already expose ASIO there). No separate SDK
+checkout is required.
+
 ### Installers
 
 `fm1ception/installer/build_all.sh` makes the release installers: a signed, notarized macOS

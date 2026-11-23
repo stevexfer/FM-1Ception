@@ -274,6 +274,12 @@ if(FM1C_NEEDS_CURL)
 else()
     list(APPEND FM1C_DEFINITIONS JUCE_USE_CURL=0)
 endif()
+if(WIN32)
+    # Standalone audio I/O: JUCE's ASIO backend (Steinberg headers in JUCE) so the
+    # standalone's audio settings can pick ASIO drivers as well as WASAPI/DirectSound
+    # (same as Hotwire's hotwire_configure_target).
+    list(APPEND FM1C_DEFINITIONS JUCE_ASIO=1)
+endif()
 target_compile_definitions(FM1Ception PUBLIC ${FM1C_DEFINITIONS} JUCE_VST3_CAN_REPLACE_VST2=0)
 
 target_link_libraries(FM1Ception PRIVATE
