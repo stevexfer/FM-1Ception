@@ -129,6 +129,18 @@ else()
         endif()
         set(_cargo_target --target ${_triple})
         set(ENGINE_LIB "${CARGO_TARGET_DIR}/${_triple}/release/fm1ception_engine.lib")
+    elseif(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
+            set(_triple x86_64-unknown-linux-gnu)
+        elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+            set(_triple aarch64-unknown-linux-gnu)
+        endif()
+        if(_triple)
+            set(_cargo_target --target ${_triple})
+            set(ENGINE_LIB "${CARGO_TARGET_DIR}/${_triple}/release/libfm1ception_engine.a")
+        else()
+            set(ENGINE_LIB "${CARGO_TARGET_DIR}/release/libfm1ception_engine.a")
+        endif()
     else()
         set(ENGINE_LIB "${CARGO_TARGET_DIR}/release/libfm1ception_engine.a")
     endif()
@@ -279,6 +291,8 @@ if(WIN32)
     # standalone's audio settings can pick ASIO drivers as well as WASAPI/DirectSound
     # (same as Hotwire's hotwire_configure_target).
     list(APPEND FM1C_DEFINITIONS JUCE_ASIO=1)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND FM1C_DEFINITIONS JUCE_ALSA=1 JUCE_JACK=1)
 endif()
 target_compile_definitions(FM1Ception PUBLIC ${FM1C_DEFINITIONS} JUCE_VST3_CAN_REPLACE_VST2=0)
 
@@ -293,6 +307,8 @@ target_link_libraries(FM1Ception PRIVATE
 
 if(MSVC)
     target_compile_options(FM1Ception PRIVATE /bigobj /MP /W3 /utf-8)
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(FM1Ception PRIVATE -Wl,--gc-sections)
 endif()
 
 # ---------------------------------------------------------------------------

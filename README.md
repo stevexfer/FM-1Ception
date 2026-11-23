@@ -156,7 +156,7 @@ You need:
   ```sh
   sudo apt install build-essential pkg-config cmake ninja-build libasound2-dev libcurl4-openssl-dev \
       libfontconfig1-dev libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
-      libxi-dev libxinerama-dev libxrandr-dev libxrender-dev
+      libxi-dev libxinerama-dev libxrandr-dev libxrender-dev libjack-jackd2-dev
   ```
 
 ```sh
@@ -181,8 +181,10 @@ checkout is required.
 ### Installers
 
 `fm1ception/installer/build_all.sh` makes the release installers: a signed, notarized macOS
-`.pkg`, and a Windows installer built in a Parallels VM with Inno Setup. Signing comes from the
-environment or a git-ignored `fm1ception/installer/macos/signing.local.sh` (see
+`.pkg`, a Windows `.exe` built in a Parallels VM with Inno Setup, and (with `linux` on the command
+line) zip archives for Linux x86-64 and arm64 from the Ubuntu VM via `installer/linux/build_packages.sh`.
+Each Linux zip has the VST3 bundle, the standalone binary, `LICENSE` and `INSTALL.txt`. Signing
+comes from the environment or a git-ignored `fm1ception/installer/macos/signing.local.sh` (see
 `make_installer.sh`).
 
 ### Tests

@@ -1,7 +1,7 @@
 # FM-1Ception for Linux: the VST3 and the standalone, x86-64 and arm64, smoke-tested.
 #
 # Built in Ubuntu 22.04 (glibc 2.35), so they run on it, Debian 12, Fedora 36, Arch and anything
-# newer. Publishing a release attaches them to it as tarballs, beside the macOS and Windows
+# newer. Publishing a release attaches them as .zip archives, beside the macOS and Windows
 # installers fm1ception/installer/build_all.sh makes. On a pull request that changes the plugin,
 # or run by hand, they are kept as the run's artifacts instead.
 
@@ -46,7 +46,7 @@ jobs:
             build-essential pkg-config cmake ninja-build git curl ca-certificates \
             libasound2-dev libcurl4-openssl-dev libfontconfig1-dev libfreetype-dev \
             libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev \
-            libxi-dev libxrandr-dev libxrender-dev
+            libxi-dev libxrandr-dev libxrender-dev libjack-jackd2-dev zip
 
       - name: Rust
         run: |
@@ -75,14 +75,19 @@ jobs:
         env:
           RELEASE: ${{ github.event.release.name || github.event.release.tag_name }}
         run: |
-          version=${RELEASE:-${GITHUB_SHA:0:12}}
+          label=$(tr -d '\r' < fm1ception/installer/label.txt)
+          version=${RELEASE:-$label}
           version=$(printf %s "$version" | tr -c 'A-Za-z0-9._-' '_')
-          name=FM-1Ception_${version}_Linux_${{ matrix.arch }}
-          mkdir -p "dist/$name"
+          folder=FM-1Ception_${version}_Linux_${{ matrix.arch }}
+          archive=Install_FM-1Ception_${version}_Linux_${{ matrix.arch }}.zip
+          mkdir -p "dist/$folder"
           cp -R build/FM1Ception_artefacts/Release/VST3/FM-1Ception.vst3 \
                 build/FM1Ception_artefacts/Release/Standalone/FM-1Ception \
-                fm1ception/LICENSE "dist/$name/"
-          cat > "dist/$name/INSTALL.txt" <<'EOF'
+                fm1ception/LICENSE "dist/$folder/"
+          strip --strip-unneeded "dist/$folder/FM-1Ception" 2>/dev/null || true
+          so="$(find "dist/$folder/FM-1Ception.vst3" -name 'FM-1Ception.so' | head -1)"
+          [ -n "$so" ] && strip --strip-unneeded "$so" 2>/dev/null || true
+          cat > "dist/$folder/INSTALL.txt" <<'EOF'
           FM-1Ception for Linux
 
           VST3:       copy FM-1Ception.vst3 into ~/.vst3/ (or /usr/lib/vst3/ for everyone)
@@ -91,13 +96,13 @@ jobs:
           It needs glibc 2.35 or newer, ALSA, FreeType, Fontconfig and X11, which a desktop
           has. The Cloud tab also needs libcurl (libcurl.so.4).
           EOF
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          echo "TARBALL=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          (cd dist && zip -rq "$archive" "$folder")
+          echo "ARCHIVE=dist/$archive" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: ${{ env.TARBALL }}
+          path: ${{ env.ARCHIVE }}
 
   release:
     if: github.event_name == 'release'
@@ -113,4 +118,4 @@ jobs:
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tar.gz --clobber -R "${{ github.repository }}"
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.zip --clobber -R "${{ github.repository }}"
