@@ -183,6 +183,8 @@ void CloudView::refill()
     for (int i = 0; i < (int) entries.size(); ++i)
     {
         const auto& e = entries[(size_t) i];
+        if (cloud.isIgnored (e))
+            continue;
         const auto* source = sourceOf (e);
         const auto said = source != nullptr ? source->searchText() : juce::String();
         if (std::all_of (words.begin(), words.end(), [&e, &said] (const juce::String& w)
@@ -282,7 +284,12 @@ void CloudView::updateStatus()
     else if (error.isNotEmpty())
         statusLine = count + " as fetched " + when + "  -  could not fetch it again: " + error;
     else
+    {
         statusLine = count + (shown != total ? " (" + juce::String (shown) + " shown)" : juce::String()) + " in mutant.cloud's list, fetched " + when;
+        const int hidden = (int) std::count_if (entries.begin(), entries.end(), [&] (const Entry& e) { return cloud.isIgnored (e); });
+        if (hidden > 0)
+            statusLine += "  -  " + juce::String (hidden) + " hidden";
+    }
 
     const auto folder = cloud.downloadFolder();
     hintLine = "Downloads go to "
@@ -295,7 +302,15 @@ void CloudView::updateStatus()
               : error.isNotEmpty() ? "Could not fetch the list of firmwares (" + error + ").  Refresh tries again."
                                    : "Refresh fetches the list of firmwares from mutant.cloud.";
     else if (shown == 0)
-        empty = "No firmware has \"" + searchText.trim() + "\" in its name, author, tags, about or source facts.";
+    {
+        if (searchText.trim().isEmpty()
+            && std::none_of (entries.begin(), entries.end(), [&] (const Entry& e) { return ! cloud.isIgnored (e); })
+            && total > 0)
+            empty = "Every row is hidden. Delete CloudCatalog-ignored.json in Application Support to show them again, "
+                     "or edit it to remove an id or version key.";
+        else
+            empty = "No firmware has \"" + searchText.trim() + "\" in its name, author, tags, about or source facts.";
+    }
     note.setText (empty, juce::dontSendNotification);
     note.setVisible (empty.isNotEmpty());
     repaint();
@@ -609,6 +624,23 @@ void CloudView::showRowMenu (int row)
         m.addItem ("Open on the FM-1 Firmware Hub", [url = e.hubPage()] { open (url); });
     if (LibraryView::openableUrl (e.installer).isNotEmpty())
         m.addItem ("Open Its Installer Page", [url = e.installer] { open (url); });
+    m.addSeparator();
+    m.addItem ("Ignore this version (blacklist title version)", [safe, e]
+    {
+        if (safe != nullptr)
+        {
+            safe->cloud.ignoreVersion (e);
+            safe->refill();
+        }
+    });
+    m.addItem ("Ignore this title (blacklist all versions)", [safe, e]
+    {
+        if (safe != nullptr)
+        {
+            safe->cloud.ignoreTitle (e);
+            safe->refill();
+        }
+    });
     m.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
 }
 } // namespace fm1c

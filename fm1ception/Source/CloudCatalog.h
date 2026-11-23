@@ -2,6 +2,7 @@
 
 #include <JuceHeader.h>
 #include <map>
+#include <set>
 #include "FirmwareLibrary.h"
 #include "ScreenCache.h"
 
@@ -17,7 +18,8 @@ namespace fm1c
 // when there is no network:
 //
 //   macOS    ~/Library/Application Support/Xfer Records/FM-1Ception/CloudCatalog.json (and -2),
-//            CloudFailures.json (the last download error per row, until the list changes)
+//            CloudCatalog-failures.json (the last download error per row, until the list changes),
+//            CloudCatalog-ignored.json (rows the user has hidden from the CLOUD tab)
 //
 // The Hub drops a firmware's old package when a new version comes, and
 // fm1-emu's list is only remade now and then, so the Hub's own catalog
@@ -145,6 +147,11 @@ public:
     /** Fetches it if this process has not yet. */
     void refreshOnce();
 
+    /** Hidden from the CLOUD tab: this release (`id@version`) or every release of this list id. */
+    bool isIgnored (const Entry&) const;
+    void ignoreVersion (const Entry&);
+    void ignoreTitle (const Entry&);
+
     enum class Status { get, downloading, inLibrary, update, installerOnly, failed };
     Status statusOf (const Entry&) const;
     /** The last download's failure for it. */
@@ -211,6 +218,9 @@ private:
     void savePersistedFailures() const;
     /** Drops stale rows, merges what's left into `failures`, invalidates a row whose list metadata changed. */
     void mergePersistedFailures();
+    juce::File ignoredPath() const;
+    void loadIgnored();
+    void saveIgnored() const;
     void clearFailure (const juce::String& key);
     void rememberFailure (const Entry& e, const juce::String& error);
     void reindex();
@@ -254,6 +264,8 @@ private:
     std::map<juce::String, juce::String> failures;
     std::map<juce::String, PersistedFailure> persistedFailures;
     bool persistedDirty = false;
+    std::set<juce::String> ignoredVersions, ignoredTitles;
+    bool ignoredDirty = false;
 
     std::atomic<bool> quitting { false };
     juce::CriticalSection postLock;

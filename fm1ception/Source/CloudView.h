@@ -19,8 +19,9 @@ struct LibraryEngines
 // with what each is, who made it, and whether it is in the library yet. GET
 // (or UPDATE, for a newer version of one in it) downloads it into the
 // library's folder; double-click (or Return) downloads it if need be and loads
-// it into the selected engine. Right-click for Load to Engine, its project's
-// page, its card on the FM-1 Firmware Hub. The footer says how old the list is.
+// it into the selected engine. Right-click for Load to Engine, ignore a version
+// or title, its project's page, its card on the FM-1 Firmware Hub. The footer
+// says how old the list is.
 //==============================================================================
 class CloudView : public juce::Component,
                   private juce::TableListBoxModel,

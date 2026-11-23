@@ -510,6 +510,83 @@ juce::File CloudCatalog::failuresPath() const
     return cache.getSiblingFile (cache.getFileNameWithoutExtension() + "-failures.json");
 }
 
+juce::File CloudCatalog::ignoredPath() const
+{
+    return cache.getSiblingFile (cache.getFileNameWithoutExtension() + "-ignored.json");
+}
+
+void CloudCatalog::loadIgnored()
+{
+    ignoredVersions.clear();
+    ignoredTitles.clear();
+    const auto path = ignoredPath();
+    if (! path.existsAsFile())
+        return;
+    const auto v = juce::JSON::parse (path.loadFileAsString());
+    if (const auto* a = v["versions"].getArray())
+        for (const auto& x : *a)
+            if (const auto s = x.toString().trim(); s.isNotEmpty())
+                ignoredVersions.insert (s);
+    if (const auto* a = v["titles"].getArray())
+        for (const auto& x : *a)
+            if (const auto s = x.toString().trim().toLowerCase(); s.isNotEmpty())
+                ignoredTitles.insert (s);
+}
+
+void CloudCatalog::saveIgnored() const
+{
+    if (! ignoredDirty)
+        return;
+    juce::Array<juce::var> vers, ids;
+    for (const auto& k : ignoredVersions)
+        vers.add (k);
+    for (const auto& k : ignoredTitles)
+        ids.add (k);
+    auto* top = new juce::DynamicObject();
+    top->setProperty ("versions", vers);
+    top->setProperty ("titles", ids);
+    if (ignoredPath().getParentDirectory().createDirectory())
+        ignoredPath().replaceWithText (juce::JSON::toString (juce::var (top), true));
+    const_cast<CloudCatalog*> (this)->ignoredDirty = false;
+}
+
+static juce::String titleKeyOf (const CloudCatalog::Entry& e)
+{
+    if (e.id.isNotEmpty())
+        return e.id.trim().toLowerCase();
+    return e.name.trim().toLowerCase();
+}
+
+bool CloudCatalog::isIgnored (const Entry& e) const
+{
+    if (ignoredTitles.count (titleKeyOf (e)) > 0)
+        return true;
+    return ignoredVersions.count (e.key()) > 0;
+}
+
+void CloudCatalog::ignoreVersion (const Entry& e)
+{
+    if (ignoredVersions.insert (e.key()).second)
+    {
+        ignoredDirty = true;
+        saveIgnored();
+        sendChangeMessage();
+    }
+}
+
+void CloudCatalog::ignoreTitle (const Entry& e)
+{
+    const auto key = titleKeyOf (e);
+    if (key.isEmpty())
+        return;
+    if (ignoredTitles.insert (key).second)
+    {
+        ignoredDirty = true;
+        saveIgnored();
+        sendChangeMessage();
+    }
+}
+
 juce::String CloudCatalog::fingerprintOf (const Entry& e)
 {
     return e.id + "|" + e.version + "|" + e.package + "|" + e.sha256 + "|" + e.embedded + "|" + e.installer + "|" + e.hub;
@@ -639,6 +716,7 @@ CloudCatalog::~CloudCatalog()
     pool.removeAllJobs (true, 30000);
     cancelPendingUpdate();
     savePersistedFailures();
+    saveIgnored();
     library.removeChangeListener (this);
 }
 
@@ -650,6 +728,7 @@ juce::File CloudCatalog::cacheOf (size_t index) const
 void CloudCatalog::loadCache()
 {
     loadPersistedFailures();
+    loadIgnored();
     if (! cache.existsAsFile())
         return;
     juce::String error;
